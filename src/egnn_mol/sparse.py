@@ -1,11 +1,3 @@
-"""Sparse torch-geometric E(3)-equivariant backbone.
-
-Operates on packed node tensors ``(N, .)`` with a ``batch`` vector, so it handles variable-size
-(ragged) graph batches. Reuses the same :class:`EquivariantUpdate` and ``minimum_image`` as the
-dense backbone, with matching sign conventions, so both agree numerically on a shared graph.
-
-Requires ``torch-geometric`` (``pip install egnn-mol[pyg]``)."""
-
 from typing import Literal
 
 import torch

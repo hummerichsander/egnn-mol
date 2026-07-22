@@ -1,9 +1,3 @@
-"""Dense native-torch E(3)-equivariant backbone.
-
-Operates on batched padded tensors ``(B, N, .)``. A neighborhood is selected once per forward
-(kNN / sparse-adjacency / within-cutoff) and shared across layers, so no dense ``(B, N, N)``
-tensor is materialized when a sparse neighborhood is used. Depends only on torch + einops."""
-
 from typing import Literal
 
 import torch

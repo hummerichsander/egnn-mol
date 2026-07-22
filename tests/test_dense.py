@@ -1,5 +1,3 @@
-"""Dense-backbone functionality beyond the symmetry properties."""
-
 import torch
 
 from egnn_mol import E3GNN

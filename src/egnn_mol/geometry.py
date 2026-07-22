@@ -1,5 +1,3 @@
-"""Geometric primitives shared by the dense and sparse backbones."""
-
 import torch
 from torch import Tensor
 

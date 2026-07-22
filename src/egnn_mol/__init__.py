@@ -1,9 +1,3 @@
-"""E(n)-equivariant GNN backbones for molecular simulation.
-
-The dense backbone (:class:`E3GNN`) and all encodings work with torch only. The sparse backbone
-(:class:`GeometricEGNN`) needs ``torch-geometric`` and is imported lazily, so ``import egnn_mol``
-never fails without the ``[pyg]`` extra installed."""
-
 import importlib
 import importlib.util
 from typing import TYPE_CHECKING

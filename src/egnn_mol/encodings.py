@@ -1,9 +1,3 @@
-"""Radial distance encodings and smooth cutoff envelopes.
-
-Each encoding is a plain function ``(dist, num_features, cutoff) -> (..., width)`` taking the
-true L2 distance. New bases are added by writing one function and one ``case`` arm in
-:func:`encode_distance` — no registry, no base class."""
-
 from typing import Literal
 
 import torch

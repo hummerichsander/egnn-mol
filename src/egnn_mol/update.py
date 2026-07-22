@@ -1,18 +1,3 @@
-"""The equivariant per-pair update shared by both backbones.
-
-Both the dense and the sparse backbone reduce, after edge construction, to work over a single
-flat axis ``P`` of directed pairs (i <- j): dense neighbor tensors ``(B, N, K, .)`` flatten to
-``(P, .)``, sparse edge tensors are already ``(E, .)``. :class:`EquivariantUpdate` owns every
-learnable piece and the distance-encoding choice, and exposes three aggregation-free methods on
-``(P, .)`` tensors. The backbones only differ in how they gather the per-pair inputs and how they
-reduce the per-pair outputs back to nodes.
-
-The update is E(3)-equivariant (features depend only on invariants; coordinate updates are linear
-combinations of relative-coordinate vectors). With ``tripp_num_layers > 0`` it additionally emits
-per-node chirality scalars (via :func:`egnn_mol.geometry.signed_volume`) that feed the coordinate
-head, reducing the symmetry to SE(3). Those scalars need a graph-level reduction, so the backbones
-compute them with their own gather/scatter and pass them back through :meth:`coord_weight`."""
-
 import torch
 from torch import Tensor, nn
 

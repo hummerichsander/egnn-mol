@@ -1,5 +1,3 @@
-"""Reusable neural building blocks."""
-
 import torch
 from torch import Tensor, nn
 

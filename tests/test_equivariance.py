@@ -1,5 +1,3 @@
-"""E(3)-equivariance and periodicity of the dense backbone (layer and full network)."""
-
 import math
 
 import torch

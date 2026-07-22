@@ -1,5 +1,3 @@
-"""Sparse-backbone tests. Skipped entirely when torch-geometric is not installed."""
-
 import math
 
 import pytest
