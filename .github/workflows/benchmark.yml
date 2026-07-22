@@ -18,8 +18,10 @@ jobs:
       - name: Create virtualenv
         run: uv venv --python 3.11
       - name: Install
+        # No build isolation (torch-cluster builds from source against torch), so the build
+        # backends must already be present: hatchling + editables, and setuptools/wheel.
         run: |
-          uv pip install torch
+          uv pip install torch hatchling editables setuptools wheel
           uv pip install --no-build-isolation -e ".[dev]"
       - name: Message-passing parity
         run: uv run --no-sync python benchmarks/message_passing.py | tee message_passing.txt

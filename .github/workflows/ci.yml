@@ -21,10 +21,12 @@ jobs:
         # rather than with --system.
         run: uv venv --python ${{ matrix.python-version }}
       - name: Install
-        # torch-cluster compiles against an installed torch, so install torch first and
-        # build the rest without isolation.
+        # torch-cluster compiles from source against an installed torch, so the whole install
+        # runs without build isolation. That means every build backend must already be in the
+        # venv: hatchling + editables for egnn-mol's editable build, setuptools/wheel for
+        # torch-cluster.
         run: |
-          uv pip install torch
+          uv pip install torch hatchling editables setuptools wheel
           uv pip install --no-build-isolation -e ".[dev]"
       - name: Ruff
         run: |
