@@ -186,8 +186,10 @@ class GeometricEGNN(nn.Module):
     """E(3)-equivariant GNN on packed torch-geometric tensors.
 
     Expects node features already projected to ``dim`` (embed upstream, as with the dense
-    backbone). When ``distance_cutoff > 0`` a minimum-image within-cutoff graph is generated and
-    unioned with the supplied static edges."""
+    backbone). The neighborhood is the union of static bonds (``edge_index`` / ``edge_attr``,
+    given from outside) and internal distance-based edges (``distance_cutoff`` radius and/or
+    ``num_nearest_neighbors`` kNN), with self-loops excluded; with none of these it is all-pairs
+    within each graph."""
 
     def __init__(
         self,
@@ -199,6 +201,7 @@ class GeometricEGNN(nn.Module):
         cutoff: float = 10.0,
         edge_dim: int = 0,
         distance_cutoff: float = 0.0,
+        num_nearest_neighbors: int = 0,
         aggr: Aggregation = "sum",
         **kwargs,
     ) -> None:
@@ -209,13 +212,16 @@ class GeometricEGNN(nn.Module):
         :param encoding: Radial distance encoding for every layer.
         :param encoding_features: Number of basis functions / frequency bands for the encoding.
         :param cutoff: Radial length scale of the encoding.
-        :param edge_dim: Edge-feature dimensionality (0 if no edge features).
-        :param distance_cutoff: If > 0, add a minimum-image within-cutoff graph to the edges.
-        :param aggr: Message aggregation for every layer.
+        :param edge_dim: Static edge-feature dimensionality (0 if no edge features).
+        :param distance_cutoff: If > 0, add a radius graph of dynamic edges.
+        :param num_nearest_neighbors: If > 0, add a kNN graph of dynamic edges.
+        :param aggr: Message aggregation onto nodes ("sum" or "mean").
         :param kwargs: Extra keyword arguments forwarded to every :class:`SparseEGNNLayer`."""
 
         super().__init__()
+        self.edge_dim = edge_dim
         self.distance_cutoff = distance_cutoff
+        self.num_nearest_neighbors = num_nearest_neighbors
         self.layers = nn.ModuleList(
             [
                 SparseEGNNLayer(
@@ -234,7 +240,7 @@ class GeometricEGNN(nn.Module):
     def forward(
         self,
         x: Tensor,
-        edge_index: Tensor,
+        edge_index: Tensor | None = None,
         edge_attr: Tensor | None = None,
         batch: Tensor | None = None,
         unitcell_lengths: Tensor | None = None,
@@ -242,18 +248,17 @@ class GeometricEGNN(nn.Module):
         """Run all message-passing layers on a packed graph.
 
         :param x: Packed node tensor (N, 3 + dim): coordinates followed by features.
-        :param edge_index: Edge connectivity (2, E) as ``[source/neighbor, target/center]``.
-        :param edge_attr: Edge features (E, edge_dim), or None.
+        :param edge_index: Static edge connectivity (2, E) as ``[source/neighbor, target/center]``,
+            or None.
+        :param edge_attr: Static edge features (E, edge_dim), or None.
         :param batch: Graph membership (N,), or None for a single graph.
         :param unitcell_lengths: Per-node box lengths (N, 3), or None.
         :return: Updated packed node tensor (N, 3 + dim)."""
 
         coors, feats = x[:, :POS_DIM], x[:, POS_DIM:]
-
-        if self.distance_cutoff > 0:
-            edge_index, edge_attr = self._add_distance_edges(
-                coors, edge_index, edge_attr, batch, unitcell_lengths
-            )
+        edge_index, edge_attr = self._build_graph(
+            coors, edge_index, edge_attr, batch, unitcell_lengths
+        )
 
         for layer in self.layers:
             coors, feats = layer(
@@ -262,26 +267,42 @@ class GeometricEGNN(nn.Module):
 
         return torch.cat([coors, feats], dim=-1)
 
-    def _add_distance_edges(
+    def _build_graph(
         self,
         coors: Tensor,
-        edge_index: Tensor,
+        edge_index: Tensor | None,
         edge_attr: Tensor | None,
         batch: Tensor | None,
         box: Tensor | None,
     ) -> tuple[Tensor, Tensor | None]:
-        """Union the static edges with a minimum-image within-cutoff graph.
+        """Union static bonds with internal distance-based (radius / kNN) edges.
 
-        Generated edges get zero edge features; duplicates are coalesced (summing attributes).
+        Dynamic edges get zero edge features; duplicates are coalesced (summing attributes, so
+        static features survive). With no static edges and no distance graph the result is
+        all-pairs within each graph (radius with infinite cutoff).
 
-        :return: The unioned ``(edge_index, edge_attr)``."""
+        :return: The combined ``(edge_index, edge_attr)``."""
 
-        extra = radius_graph_pbc(coors, self.distance_cutoff, batch, box)
-        edge_index = torch.cat([edge_index, extra], dim=1)
-        if edge_attr is not None:
-            pad = edge_attr.new_zeros(extra.shape[1], edge_attr.shape[1])
-            edge_attr = torch.cat([edge_attr, pad], dim=0)
+        n = coors.shape[0]
+        dynamic: list[Tensor] = []
+        if self.distance_cutoff > 0:
+            dynamic.append(radius_graph_pbc(coors, self.distance_cutoff, batch, box))
+        if self.num_nearest_neighbors > 0:
+            dynamic.append(knn_graph_pbc(coors, self.num_nearest_neighbors, batch, box))
+        if edge_index is None and not dynamic:
+            dynamic.append(radius_graph_pbc(coors, float("inf"), batch, box))
+
+        indices = ([edge_index] if edge_index is not None else []) + dynamic
+
+        if self.edge_dim > 0:
+            attrs = [edge_attr] if edge_index is not None else []
+            attrs += [
+                coors.new_zeros(extra.shape[1], self.edge_dim) for extra in dynamic
+            ]
             return coalesce(
-                edge_index, edge_attr, num_nodes=coors.shape[0], reduce="sum"
+                torch.cat(indices, dim=1),
+                torch.cat(attrs, dim=0),
+                num_nodes=n,
+                reduce="sum",
             )
-        return coalesce(edge_index, num_nodes=coors.shape[0]), None
+        return coalesce(torch.cat(indices, dim=1), num_nodes=n), None

@@ -21,7 +21,7 @@ def test_return_coor_changes(system):
     assert torch.allclose(changes[0], coors)
 
 
-def test_distance_cutoff_path_runs(system):
+def test_radius_graph_runs(system):
     feats, coors, L = system
     net = E3GNN(depth=2, dim=8, m_dim=8, distance_cutoff=4.0).eval()
     with torch.no_grad():
@@ -29,12 +29,20 @@ def test_distance_cutoff_path_runs(system):
     assert torch.isfinite(f_out).all() and torch.isfinite(c_out).all()
 
 
-def test_sparse_neighbors_with_adjacency(system):
+def test_knn_graph_runs(system):
+    feats, coors, L = system
+    net = E3GNN(depth=2, dim=8, m_dim=8, num_nearest_neighbors=3).eval()
+    with torch.no_grad():
+        f_out, c_out = net(feats, coors, L)
+    assert f_out.shape == feats.shape and c_out.shape == coors.shape
+
+
+def test_static_bonds_only(system):
     feats, coors, L = system
     n = coors.shape[1]
-    adj = (torch.rand(n, n) > 0.5)
+    adj = torch.rand(n, n) > 0.5
     adj = adj | adj.T
-    net = E3GNN(depth=2, dim=8, m_dim=8, only_sparse_neighbors=True).eval()
+    net = E3GNN(depth=2, dim=8, m_dim=8).eval()  # no distance_cutoff, no kNN
     with torch.no_grad():
         f_out, c_out = net(feats, coors, L, adj_mat=adj)
     assert f_out.shape == feats.shape and c_out.shape == coors.shape

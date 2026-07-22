@@ -90,48 +90,97 @@ def test_ragged_batch_no_leakage():
     assert torch.allclose(out[na:], out_b, atol=1e-5)
 
 
+def test_internal_graph_from_knobs():
+    """The sparse backbone builds its own graph from distance_cutoff / num_nearest_neighbors."""
+    from egnn_mol import GeometricEGNN
+
+    torch.manual_seed(3)
+    n = 12
+    x = torch.cat([torch.rand(n, 3) * 3.0, torch.randn(n, 8)], dim=-1)
+    for kwargs in (dict(distance_cutoff=1.5), dict(num_nearest_neighbors=4)):
+        net = GeometricEGNN(depth=2, dim=8, m_dim=8, **kwargs).eval()
+        with torch.no_grad():
+            out = net(x)  # edge_index=None -> built internally
+        assert out.shape == x.shape and torch.isfinite(out).all()
+
+
+def test_static_union_dynamic():
+    """Providing bonds AND a distance_cutoff unions the two edge sets."""
+    from egnn_mol import GeometricEGNN
+
+    torch.manual_seed(4)
+    n = 10
+    x = torch.cat([torch.rand(n, 3) * 3.0, torch.randn(n, 8)], dim=-1)
+    bonds = full_edge_index(torch.arange(n), include_self=False)[:, :6]  # a few static edges
+    net = GeometricEGNN(depth=2, dim=8, m_dim=8, distance_cutoff=1.5).eval()
+    with torch.no_grad():
+        out = net(x, edge_index=bonds)
+    assert out.shape == x.shape and torch.isfinite(out).all()
+
+
+def _sparse_edges_from_adj(adj: torch.Tensor, dense_edges: torch.Tensor | None):
+    """Convert a symmetric (N, N) adjacency into sparse [neighbor, center] edges + attrs.
+
+    Matches the dense convention: for center i and neighbor j, the edge feature is
+    ``dense_edges[0, i, j]``."""
+    center, neighbor = adj.nonzero(as_tuple=True)  # adj[i, j] -> center i, neighbor j
+    edge_index = torch.stack([neighbor, center], dim=0)
+    edge_attr = None if dense_edges is None else dense_edges[0, center, neighbor]
+    return edge_index, edge_attr
+
+
 @pytest.mark.parametrize("periodic", [False, True])
 @pytest.mark.parametrize("edge_dim", [0, 3])
 @pytest.mark.parametrize("tripp", [0, 2])
-def test_cross_backbone_agreement(periodic, edge_dim, tripp):
-    """Dense (all-pairs incl. self) and sparse (same graph) agree exactly with shared weights.
+@pytest.mark.parametrize("graph", ["bonds", "radius"])
+def test_cross_backbone_agreement(periodic, edge_dim, tripp, graph):
+    """Dense and sparse agree exactly with shared weights and the same unified graph.
 
-    Swept over open/periodic boundaries, presence of edge features, and the E(3)/SE(3) term —
-    the definitive proof that the two backbones implement the same function."""
+    Swept over static-bond vs internal-radius graphs, open/periodic boundaries, edge features, and
+    the E(3)/SE(3) term — the definitive proof that the two backbones implement one function."""
     from egnn_mol import GeometricEGNN
+
+    if graph == "radius" and edge_dim:
+        pytest.skip("dynamic edges carry no features; edge_dim only applies to static bonds")
 
     torch.manual_seed(2)
     n, dim, depth = 7, 8, 2
     coors = torch.rand(n, 3) * 4.0
     feats = torch.randn(n, dim)
     box = torch.tensor([4.0, 4.5, 3.5]) if periodic else None
+    distance_cutoff = 2.5 if graph == "radius" else 0.0
 
-    dense = E3GNN(
-        depth=depth, dim=dim, m_dim=8, edge_dim=edge_dim, tripp_num_layers=tripp
-    ).eval()
-    sparse = GeometricEGNN(
-        depth=depth, dim=dim, m_dim=8, edge_dim=edge_dim, tripp_num_layers=tripp
-    ).eval()
+    common = dict(
+        depth=depth,
+        dim=dim,
+        m_dim=8,
+        edge_dim=edge_dim,
+        tripp_num_layers=tripp,
+        distance_cutoff=distance_cutoff,
+    )
+    dense = E3GNN(**common).eval()
+    sparse = GeometricEGNN(**common).eval()
     for dl, sl in zip(dense.layers, sparse.layers):
         sl.core.load_state_dict(dl.core.state_dict())
 
-    edge_index = full_edge_index(torch.arange(n), include_self=True)
-    dst, src = edge_index[1], edge_index[0]
-
-    dense_edges = sparse_edge_attr = None
-    if edge_dim:
-        dense_edges = torch.randn(1, n, n, edge_dim)
-        sparse_edge_attr = dense_edges[0, dst, src]  # (E, edge_dim): dense[b, i=center, j=neighbor]
+    adj_mat = dense_edges = edge_index = edge_attr = None
+    if graph == "bonds":
+        adj = torch.rand(n, n) > 0.4
+        adj = (adj | adj.T) & ~torch.eye(n, dtype=torch.bool)
+        adj_mat = adj
+        if edge_dim:
+            dense_edges = torch.randn(1, n, n, edge_dim)
+        edge_index, edge_attr = _sparse_edges_from_adj(adj, dense_edges)
 
     dense_box = box[None] if periodic else None
     sparse_box = box.expand(n, 3) if periodic else None
 
     with torch.no_grad():
-        f_d, c_d = dense(feats[None], coors[None], dense_box, edges=dense_edges)
+        f_d, c_d = dense(feats[None], coors[None], dense_box, adj_mat=adj_mat, edges=dense_edges)
         out_s = sparse(
             torch.cat([coors, feats], -1),
-            edge_index,
-            edge_attr=sparse_edge_attr,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
             unitcell_lengths=sparse_box,
         )
 
