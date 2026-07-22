@@ -2,30 +2,30 @@ import torch
 from torch import Tensor
 
 
-def minimum_image(rel_coors: Tensor, box: Tensor | None) -> Tensor:
+def minimum_image(rel_pos: Tensor, box: Tensor | None) -> Tensor:
     """Apply the orthorhombic minimum-image convention to displacement vectors.
 
     The wrap acts on the trailing spatial axis only and broadcasts over all leading
     axes, so the dense backbone can pass a box of shape (B, 1, 3) and the sparse
     backbone a per-edge box of shape (E, 3) — both hit the same implementation.
 
-    :param rel_coors: Displacement vectors with a trailing spatial axis (..., 3).
-    :param box: Box lengths broadcastable to ``rel_coors`` (e.g. (3,), (E, 3), (B, 1, 3));
+    :param rel_pos: Displacement vectors with a trailing spatial axis (..., 3).
+    :param box: Box lengths broadcastable to ``rel_pos`` (e.g. (3,), (E, 3), (B, 1, 3));
         None disables periodicity.
-    :return: Displacements wrapped into the primary cell, same shape as ``rel_coors``."""
+    :return: Displacements wrapped into the primary cell, same shape as ``rel_pos``."""
 
     if box is None:
-        return rel_coors
-    return rel_coors - box * torch.round(rel_coors / box)
+        return rel_pos
+    return rel_pos - box * torch.round(rel_pos / box)
 
 
-def squared_distance(rel_coors: Tensor) -> Tensor:
+def squared_distance(rel_pos: Tensor) -> Tensor:
     """Squared L2 norm of displacement vectors along the trailing axis.
 
-    :param rel_coors: Displacement vectors (..., 3).
+    :param rel_pos: Displacement vectors (..., 3).
     :return: Squared distances (..., 1)."""
 
-    return (rel_coors**2).sum(dim=-1, keepdim=True)
+    return (rel_pos**2).sum(dim=-1, keepdim=True)
 
 
 def signed_volume(v1: Tensor, v2: Tensor, v3: Tensor) -> Tensor:

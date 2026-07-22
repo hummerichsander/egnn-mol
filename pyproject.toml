@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-pyg = ["torch-geometric>=2.7.0"]
+pyg = ["torch-geometric>=2.7.0", "torch-cluster>=1.6.0"]
 dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0", "ruff>=0.14.0"]
 
 [build-system]

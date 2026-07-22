@@ -47,10 +47,10 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-class CoorsNorm(nn.Module):
+class PosNorm(nn.Module):
     """Normalize displacement vectors to unit length, then rescale by a learnable factor.
 
-    Normalizing keeps coordinate-update magnitudes independent of the box / bond lengths,
+    Normalizing keeps position-update magnitudes independent of the box / bond lengths,
     which matters under periodic boundary conditions. The dense backbone initializes the
     scale small (near-identity updates); the sparse backbone uses ``scale_init=1.0``."""
 
@@ -61,7 +61,7 @@ class CoorsNorm(nn.Module):
         self.eps = eps
         self.scale = nn.Parameter(torch.zeros(1).fill_(scale_init))
 
-    def forward(self, coors: Tensor) -> Tensor:
-        """:param coors: Displacement vectors (..., 3). :return: Rescaled unit vectors (..., 3)."""
-        norm = coors.norm(dim=-1, keepdim=True)
-        return coors / norm.clamp(min=self.eps) * self.scale
+    def forward(self, pos: Tensor) -> Tensor:
+        """:param pos: Displacement vectors (..., 3). :return: Rescaled unit vectors (..., 3)."""
+        norm = pos.norm(dim=-1, keepdim=True)
+        return pos / norm.clamp(min=self.eps) * self.scale

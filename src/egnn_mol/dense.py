@@ -38,16 +38,16 @@ def batched_index_select(values: Tensor, indices: Tensor, dim: int) -> Tensor:
     return values.gather(dim, idx)
 
 
-def _box_for_pairs(unitcell_lengths: Tensor | None) -> Tensor | None:
+def _box_for_pairs(box: Tensor | None) -> Tensor | None:
     """Reshape per-graph box lengths (B, 3) to (B, 1, 1, 3) for pairwise broadcasting."""
-    if unitcell_lengths is None:
+    if box is None:
         return None
-    return unitcell_lengths.view(unitcell_lengths.shape[0], 1, 1, 3)
+    return box.view(box.shape[0], 1, 1, 3)
 
 
 def build_neighborhood(
-    coors: Tensor,
-    unitcell_lengths: Tensor | None,
+    pos: Tensor,
+    box: Tensor | None,
     adj_mat: Tensor | None,
     mask: Tensor | None,
     distance_cutoff: float,
@@ -57,27 +57,23 @@ def build_neighborhood(
 
     The graph is the union of the static ``adj_mat`` edges, a radius graph (``distance_cutoff``),
     and a kNN graph (``num_nearest_neighbors``), all under the minimum-image convention and with
-    self-loops removed. It is derived once from the input coordinates and shared across layers.
+    self-loops removed. It is derived once from the input positions and shared across layers.
 
-    :param coors: Node coordinates (B, N, 3).
-    :param unitcell_lengths: Periodic box lengths (B, 3), or None.
+    :param pos: Node positions (B, N, 3).
+    :param box: Periodic box lengths (B, 3), or None.
     :param adj_mat: Static boolean adjacency (B, N, N) or (N, N), or None.
     :param mask: Node validity mask (B, N), or None.
     :param distance_cutoff: Radius cutoff for dynamic edges (0 disables).
     :param num_nearest_neighbors: kNN degree for dynamic edges (0 disables).
     :return: Neighbor indices (B, N, K) and a boolean edge-validity mask (B, N, K)."""
 
-    b, n, _ = coors.shape
-    device = coors.device
+    b, n, _ = pos.shape
+    device = pos.device
     eye = torch.eye(n, dtype=torch.bool, device=device)[None]
 
     with torch.no_grad():
-        rel = rearrange(coors, "b i d -> b i () d") - rearrange(
-            coors, "b j d -> b () j d"
-        )
-        dist_sq = (minimum_image(rel, _box_for_pairs(unitcell_lengths)) ** 2).sum(
-            dim=-1
-        )
+        rel = rearrange(pos, "b i d -> b i () d") - rearrange(pos, "b j d -> b () j d")
+        dist_sq = (minimum_image(rel, _box_for_pairs(box)) ** 2).sum(dim=-1)
 
         pair_valid = torch.ones(b, n, n, dtype=torch.bool, device=device)
         if mask is not None:
@@ -128,11 +124,11 @@ class DenseEGNNLayer(nn.Module):
         edge_dim: int = 0,
         aggr: Aggregation = "sum",
         dropout: float = 0.0,
-        norm_feats: bool = False,
-        norm_coors: bool = False,
-        norm_coors_scale_init: float = 1e-2,
+        norm_x: bool = False,
+        norm_pos: bool = False,
+        norm_pos_scale_init: float = 1e-2,
         soft_edges: bool = False,
-        coor_weights_clamp_value: float | None = None,
+        pos_weights_clamp_value: float | None = None,
         tripp_num_layers: int = 0,
     ) -> None:
         """See :class:`E3GNN` for the meaning of the arguments."""
@@ -148,60 +144,61 @@ class DenseEGNNLayer(nn.Module):
             m_dim=m_dim,
             edge_dim=edge_dim,
             soft_edges=soft_edges,
-            norm_feats=norm_feats,
-            norm_coors=norm_coors,
-            norm_coors_scale_init=norm_coors_scale_init,
+            norm_x=norm_x,
+            norm_pos=norm_pos,
+            norm_pos_scale_init=norm_pos_scale_init,
             dropout=dropout,
-            coor_weights_clamp_value=coor_weights_clamp_value,
+            pos_weights_clamp_value=pos_weights_clamp_value,
             tripp_num_layers=tripp_num_layers,
         )
 
     def forward(
         self,
-        feats: Tensor,
-        coors: Tensor,
-        unitcell_lengths: Tensor | None = None,
-        edges: Tensor | None = None,
+        x: Tensor,
+        pos: Tensor,
+        edge_attr: Tensor | None = None,
         mask: Tensor | None = None,
+        box: Tensor | None = None,
         nbhd_indices: Tensor | None = None,
         nbhd_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Message-passing update over a neighborhood (or all-pairs, self-excluded, if none given).
 
-        :param feats: Node features (B, N, D).
-        :param coors: Node coordinates (B, N, 3).
-        :param unitcell_lengths: Periodic box lengths (B, 3), or None.
-        :param edges: Edge features — dense (B, N, N, E) or, with ``nbhd_indices``, (B, N, K, E).
+        :param x: Node features (B, N, dim).
+        :param pos: Node positions (B, N, 3).
+        :param edge_attr: Edge features — dense (B, N, N, edge_dim) or, with ``nbhd_indices``,
+            (B, N, K, edge_dim).
         :param mask: Node validity mask (B, N), or None.
+        :param box: Periodic box lengths (B, 3), or None.
         :param nbhd_indices: Precomputed neighbor indices (B, N, K), or None for all-pairs.
         :param nbhd_mask: Precomputed edge-validity mask (B, N, K), or None.
-        :return: Updated features (B, N, D) and coordinates (B, N, 3)."""
+        :return: Updated features (B, N, dim) and positions (B, N, 3)."""
 
-        box = _box_for_pairs(unitcell_lengths)
-        b, n, _ = feats.shape
+        box_pairs = _box_for_pairs(box)
+        b, n, _ = x.shape
 
         if nbhd_indices is not None:
-            coors_j = batched_index_select(coors, nbhd_indices, dim=1)
-            rel_coors = minimum_image(
-                rearrange(coors, "b i d -> b i () d") - coors_j, box
+            pos_j = batched_index_select(pos, nbhd_indices, dim=1)
+            rel_pos = minimum_image(
+                rearrange(pos, "b i d -> b i () d") - pos_j, box_pairs
             )
-            feats_j = batched_index_select(feats, nbhd_indices, dim=1)
+            x_j = batched_index_select(x, nbhd_indices, dim=1)
         else:
-            rel_coors = rearrange(coors, "b i d -> b i () d") - rearrange(
-                coors, "b j d -> b () j d"
+            rel_pos = rearrange(pos, "b i d -> b i () d") - rearrange(
+                pos, "b j d -> b () j d"
             )
-            rel_coors = minimum_image(rel_coors, box)
-            feats_j = rearrange(feats, "b j d -> b () j d")
+            rel_pos = minimum_image(rel_pos, box_pairs)
+            x_j = rearrange(x, "b j d -> b () j d")
 
-        dist = squared_distance(rel_coors).clamp(min=1e-8).sqrt()
-        feats_i = rearrange(feats, "b i d -> b i () d")
-        feats_i, feats_j = torch.broadcast_tensors(feats_i, feats_j)
+        dist = squared_distance(rel_pos).clamp(min=1e-8).sqrt()
+        x_i = rearrange(x, "b i d -> b i () d")
+        x_i, x_j = torch.broadcast_tensors(x_i, x_j)
 
-        m_ij = self.core.message(feats_i, feats_j, dist, edges)
+        m_ij = self.core.message(x_i, x_j, dist, edge_attr)
 
-        edge_mask = self._edge_mask(mask, nbhd_indices, nbhd_mask, b, n, coors.device)
+        edge_mask = self._edge_mask(mask, nbhd_indices, nbhd_mask, b, n, x.device)
 
-        normed = self.core.normalize_rel(rel_coors)
+        normed = self.core.normalize_rel(rel_pos)
 
         if self.core.tripp:
             abc = self.core.triple_abc(m_ij)  # (B, N, K, 3)
@@ -218,14 +215,14 @@ class DenseEGNNLayer(nn.Module):
             else:
                 chi_j = rearrange(chi, "b j one -> b () j one")
             chi_i, chi_j = torch.broadcast_tensors(chi_i, chi_j)
-            weight = self.core.coord_weight(m_ij, chi_i, chi_j)
+            weight = self.core.pos_weight(m_ij, chi_i, chi_j)
         else:
-            weight = self.core.coord_weight(m_ij)
+            weight = self.core.pos_weight(m_ij)
 
         delta = weight * normed
         if edge_mask is not None:
             delta = delta.masked_fill(~rearrange(edge_mask, "... -> ... ()"), 0.0)
-        coors_out = coors + delta.sum(dim=2)
+        pos_out = pos + delta.sum(dim=2)
 
         if edge_mask is not None:
             m_ij = m_ij.masked_fill(~rearrange(edge_mask, "... -> ... ()"), 0.0)
@@ -238,8 +235,8 @@ class DenseEGNNLayer(nn.Module):
         else:
             m_pooled = m_ij.sum(dim=2)
 
-        feats_out = self.core.update_feats(feats, m_pooled)
-        return feats_out, coors_out
+        x_out = self.core.update_x(x, m_pooled)
+        return x_out, pos_out
 
     def _edge_mask(
         self,
@@ -274,11 +271,10 @@ class DenseEGNNLayer(nn.Module):
 class E3GNN(nn.Module):
     """E(3)-equivariant graph neural network on dense padded tensors.
 
-    Handles periodic boxes (pass ``unitcell_lengths``) and open boundaries. The neighborhood is
-    the union of static bonds (``adj_mat`` / ``edges``, given from outside) and internal
-    distance-based edges (``distance_cutoff`` radius and/or ``num_nearest_neighbors`` kNN), with
-    self-loops excluded; with none of these it is all-pairs. It is built once and shared across
-    layers."""
+    Handles periodic boxes (pass ``box``) and open boundaries. The neighborhood is the union of
+    static bonds (``adj_mat`` / ``edge_attr``, given from outside) and internal distance-based
+    edges (``distance_cutoff`` radius and/or ``num_nearest_neighbors`` kNN), with self-loops
+    excluded; with none of these it is all-pairs. It is built once and shared across layers."""
 
     def __init__(
         self,
@@ -328,24 +324,24 @@ class E3GNN(nn.Module):
 
     def forward(
         self,
-        feats: Tensor,
-        coors: Tensor,
-        unitcell_lengths: Tensor | None = None,
+        x: Tensor,
+        pos: Tensor,
         adj_mat: Tensor | None = None,
-        edges: Tensor | None = None,
+        edge_attr: Tensor | None = None,
         mask: Tensor | None = None,
-        return_coor_changes: bool = False,
+        box: Tensor | None = None,
+        return_pos_changes: bool = False,
     ):
         """Run all message-passing layers.
 
-        :param feats: Node features (B, N, D).
-        :param coors: Node coordinates (B, N, 3).
-        :param unitcell_lengths: Periodic box lengths (B, 3), or None.
+        :param x: Node features (B, N, dim).
+        :param pos: Node positions (B, N, 3).
         :param adj_mat: Static boolean adjacency (B, N, N) or (N, N), or None.
-        :param edges: Static edge features (B, N, N, E), or None.
+        :param edge_attr: Static edge features (B, N, N, edge_dim), or None.
         :param mask: Node validity mask (B, N), or None.
-        :param return_coor_changes: If True, also return the coordinate trajectory.
-        :return: ``(feats, coors)`` or ``(feats, coors, coor_changes)``."""
+        :param box: Periodic box lengths (B, 3), or None.
+        :param return_pos_changes: If True, also return the position trajectory.
+        :return: ``(x, pos)`` or ``(x, pos, pos_changes)``."""
 
         nbhd_indices: Tensor | None = None
         nbhd_mask: Tensor | None = None
@@ -355,29 +351,29 @@ class E3GNN(nn.Module):
             or self.num_nearest_neighbors > 0
         ):
             nbhd_indices, nbhd_mask = build_neighborhood(
-                coors,
-                unitcell_lengths,
+                pos,
+                box,
                 adj_mat,
                 mask,
                 self.distance_cutoff,
                 self.num_nearest_neighbors,
             )
-            if edges is not None:
-                edges = batched_index_select(edges, nbhd_indices, dim=2)
+            if edge_attr is not None:
+                edge_attr = batched_index_select(edge_attr, nbhd_indices, dim=2)
 
-        coor_changes = [coors]
+        pos_changes = [pos]
         for layer in self.layers:
-            feats, coors = layer(
-                feats,
-                coors,
-                unitcell_lengths,
-                edges=edges,
+            x, pos = layer(
+                x,
+                pos,
+                edge_attr=edge_attr,
                 mask=mask,
+                box=box,
                 nbhd_indices=nbhd_indices,
                 nbhd_mask=nbhd_mask,
             )
-            coor_changes.append(coors)
+            pos_changes.append(pos)
 
-        if return_coor_changes:
-            return feats, coors, coor_changes
-        return feats, coors
+        if return_pos_changes:
+            return x, pos, pos_changes
+        return x, pos

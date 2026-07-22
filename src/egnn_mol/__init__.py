@@ -14,11 +14,18 @@ from .encodings import (
     polynomial_envelope,
 )
 from .geometry import minimum_image, signed_volume, squared_distance
-from .nn import MLP, CoorsNorm
+from .nn import MLP, PosNorm
 from .update import EquivariantUpdate
 
 if TYPE_CHECKING:
-    from .sparse import GeometricEGNN, SparseEGNNLayer, knn_graph_pbc, radius_graph_pbc
+    from .sparse import (
+        GeometricEGNN,
+        SparseEGNNLayer,
+        knn_edges,
+        knn_graph_pbc,
+        radius_edges,
+        radius_graph_pbc,
+    )
 
 __all__ = [
     "E3GNN",
@@ -26,9 +33,11 @@ __all__ = [
     "SparseEGNNLayer",
     "radius_graph_pbc",
     "knn_graph_pbc",
+    "radius_edges",
+    "knn_edges",
     "EquivariantUpdate",
     "MLP",
-    "CoorsNorm",
+    "PosNorm",
     "minimum_image",
     "squared_distance",
     "signed_volume",
@@ -48,6 +57,8 @@ _LAZY = {
     "SparseEGNNLayer": "sparse",
     "radius_graph_pbc": "sparse",
     "knn_graph_pbc": "sparse",
+    "radius_edges": "sparse",
+    "knn_edges": "sparse",
 }
 
 

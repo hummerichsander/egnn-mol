@@ -39,97 +39,97 @@ def rel_err(a: Tensor, b: Tensor) -> float:
     return (a - b).norm().item() / b.norm().clamp(min=1e-8).item()
 
 
-def _run_layer(layer, feats, coors, L):
-    return layer(feats, coors, L)
+def _run_layer(layer, x, pos, box):
+    return layer(x, pos, box=box)
 
 
-def _run_net(net, feats, coors, L):
-    return net(feats, coors, L)
+def _run_net(net, x, pos, box):
+    return net(x, pos, box=box)
 
 
 class TestPeriodicity:
     """Features invariant and velocity (displacement) equivariant under lattice / arbitrary shifts."""
 
     def test_layer_features_periodic(self, system):
-        feats, coors, L = system
+        x, pos, box = system
         layer = make_layer()
         with torch.no_grad():
-            f_out, _ = _run_layer(layer, feats, coors, L)
-            f_shift, _ = _run_layer(layer, feats, coors + L[:, None, :], L)
-        assert torch.allclose(f_out, f_shift, atol=1e-5)
+            x_out, _ = _run_layer(layer, x, pos, box)
+            x_shift, _ = _run_layer(layer, x, pos + box[:, None, :], box)
+        assert torch.allclose(x_out, x_shift, atol=1e-5)
 
     def test_layer_velocity_periodic(self, system):
-        feats, coors, L = system
+        x, pos, box = system
         layer = make_layer()
-        shift = L[:, None, :]
+        shift = box[:, None, :]
         with torch.no_grad():
-            _, c_out = _run_layer(layer, feats, coors, L)
-            _, c_shift = _run_layer(layer, feats, coors + shift, L)
-        assert torch.allclose(c_out - coors, c_shift - (coors + shift), atol=1e-5)
+            _, pos_out = _run_layer(layer, x, pos, box)
+            _, pos_shift = _run_layer(layer, x, pos + shift, box)
+        assert torch.allclose(pos_out - pos, pos_shift - (pos + shift), atol=1e-5)
 
     def test_net_features_invariant_to_translation(self, system):
-        feats, coors, L = system
+        x, pos, box = system
         net = make_network()
         delta = torch.tensor([[[3.1, -1.7, 4.2]], [[-2.3, 5.0, -0.8]]])
         with torch.no_grad():
-            f_out, _ = _run_net(net, feats, coors, L)
-            f_shift, _ = _run_net(net, feats, coors + delta, L)
-        assert torch.allclose(f_out, f_shift, atol=1e-5)
+            x_out, _ = _run_net(net, x, pos, box)
+            x_shift, _ = _run_net(net, x, pos + delta, box)
+        assert torch.allclose(x_out, x_shift, atol=1e-5)
 
     def test_net_velocity_invariant_to_translation(self, system):
-        feats, coors, L = system
+        x, pos, box = system
         net = make_network()
         delta = torch.tensor([[[3.1, -1.7, 4.2]], [[-2.3, 5.0, -0.8]]])
         with torch.no_grad():
-            _, c_out = _run_net(net, feats, coors, L)
-            _, c_shift = _run_net(net, feats, coors + delta, L)
-        assert torch.allclose(c_out - coors, c_shift - (coors + delta), atol=1e-5)
+            _, pos_out = _run_net(net, x, pos, box)
+            _, pos_shift = _run_net(net, x, pos + delta, box)
+        assert torch.allclose(pos_out - pos, pos_shift - (pos + delta), atol=1e-5)
 
-    def test_raw_coors_not_periodic(self, system):
-        """coors_out(x + L) == coors_out(x) + L, so only the displacement is periodic."""
-        feats, coors, L = system
+    def test_raw_pos_not_periodic(self, system):
+        """pos_out(pos + L) == pos_out(pos) + L, so only the displacement is periodic."""
+        x, pos, box = system
         net = make_network()
-        shift = L[:, None, :]
+        shift = box[:, None, :]
         with torch.no_grad():
-            _, c_out = _run_net(net, feats, coors, L)
-            _, c_shift = _run_net(net, feats, coors + shift, L)
-        assert not torch.allclose(c_out, c_shift, atol=1e-3)
+            _, pos_out = _run_net(net, x, pos, box)
+            _, pos_shift = _run_net(net, x, pos + shift, box)
+        assert not torch.allclose(pos_out, pos_shift, atol=1e-3)
 
 
 class TestEquivariance:
     """Rotation invariance of features, rotation equivariance of velocity, permutation equivariance."""
 
     def test_features_invariant_to_rotation(self, compact_system):
-        feats, coors, L = compact_system
+        x, pos, box = compact_system
         net = make_network()
         R = rotation_z(math.pi / 5)
-        centroid = coors.mean(dim=1, keepdim=True)
-        coors_rot = (coors - centroid) @ R.T + centroid
+        centroid = pos.mean(dim=1, keepdim=True)
+        pos_rot = (pos - centroid) @ R.T + centroid
         with torch.no_grad():
-            f_out, _ = _run_net(net, feats, coors, L)
-            f_rot, _ = _run_net(net, feats, coors_rot, L)
-        assert torch.allclose(f_out, f_rot, atol=1e-5)
+            x_out, _ = _run_net(net, x, pos, box)
+            x_rot, _ = _run_net(net, x, pos_rot, box)
+        assert torch.allclose(x_out, x_rot, atol=1e-5)
 
     def test_velocity_equivariant_to_rotation(self, compact_system):
-        feats, coors, L = compact_system
+        x, pos, box = compact_system
         net = make_network()
         R = rotation_z(math.pi / 5)
-        centroid = coors.mean(dim=1, keepdim=True)
-        coors_rot = (coors - centroid) @ R.T + centroid
+        centroid = pos.mean(dim=1, keepdim=True)
+        pos_rot = (pos - centroid) @ R.T + centroid
         with torch.no_grad():
-            _, c_out = _run_net(net, feats, coors, L)
-            _, c_rot = _run_net(net, feats, coors_rot, L)
-        assert torch.allclose(c_rot - coors_rot, (c_out - coors) @ R.T, atol=1e-5)
+            _, pos_out = _run_net(net, x, pos, box)
+            _, pos_rot_out = _run_net(net, x, pos_rot, box)
+        assert torch.allclose(pos_rot_out - pos_rot, (pos_out - pos) @ R.T, atol=1e-5)
 
     def test_permutation_equivariance(self, system):
-        feats, coors, L = system
+        x, pos, box = system
         net = make_network()
-        perm = torch.randperm(coors.shape[1])
+        perm = torch.randperm(pos.shape[1])
         with torch.no_grad():
-            f_out, c_out = _run_net(net, feats, coors, L)
-            f_perm, c_perm = _run_net(net, feats[:, perm], coors[:, perm], L)
-        assert torch.allclose(f_out[:, perm], f_perm, atol=1e-5)
-        assert torch.allclose((c_out - coors)[:, perm], c_perm - coors[:, perm], atol=1e-5)
+            x_out, pos_out = _run_net(net, x, pos, box)
+            x_perm, pos_perm = _run_net(net, x[:, perm], pos[:, perm], box)
+        assert torch.allclose(x_out[:, perm], x_perm, atol=1e-5)
+        assert torch.allclose((pos_out - pos)[:, perm], pos_perm - pos[:, perm], atol=1e-5)
 
 
 class TestSE3TripleProduct:
@@ -139,37 +139,37 @@ class TestSE3TripleProduct:
     improper ones (reflections) are not, whereas the plain E(3) model is symmetric under both.
     """
 
-    # norm_coors + a single layer keep coordinate magnitudes O(1) so exact symmetries certify
-    # at a tight relative tolerance while randomized weights make the chirality term measurable.
-    NET_KW = dict(depth=1, norm_coors=True, norm_coors_scale_init=1.0)
+    # norm_pos + a single layer keep position magnitudes O(1) so exact symmetries certify at a
+    # tight relative tolerance while randomized weights make the chirality term measurable.
+    NET_KW = dict(depth=1, norm_pos=True, norm_pos_scale_init=1.0)
 
-    def _transform(self, coors, M):
-        centroid = coors.mean(dim=1, keepdim=True)
-        return (coors - centroid) @ M.T + centroid
+    def _transform(self, pos, M):
+        centroid = pos.mean(dim=1, keepdim=True)
+        return (pos - centroid) @ M.T + centroid
 
     def test_rotation_equivariance_holds_with_triple_product(self, compact_system):
-        feats, coors, L = compact_system
+        x, pos, box = compact_system
         net = randomize(make_network(tripp_num_layers=2, **self.NET_KW))
         R = rotation_z(math.pi / 5)
-        coors_rot = self._transform(coors, R)
+        pos_rot = self._transform(pos, R)
         with torch.no_grad():
-            _, c_out = _run_net(net, feats, coors, L)
-            _, c_rot = _run_net(net, feats, coors_rot, L)
-        assert rel_err(c_rot - coors_rot, (c_out - coors) @ R.T) < 1e-4
+            _, pos_out = _run_net(net, x, pos, box)
+            _, pos_rot_out = _run_net(net, x, pos_rot, box)
+        assert rel_err(pos_rot_out - pos_rot, (pos_out - pos) @ R.T) < 1e-4
 
     def test_reflection_equivariance_only_without_triple_product(self, compact_system):
-        feats, coors, L = compact_system
+        x, pos, box = compact_system
         M = reflection_z()
-        coors_ref = self._transform(coors, M)
+        pos_ref = self._transform(pos, M)
 
         e3 = randomize(make_network(tripp_num_layers=0, **self.NET_KW))
         with torch.no_grad():
-            _, c_out = _run_net(e3, feats, coors, L)
-            _, c_ref = _run_net(e3, feats, coors_ref, L)
-        assert rel_err(c_ref - coors_ref, (c_out - coors) @ M.T) < 1e-4  # E(3): symmetric
+            _, pos_out = _run_net(e3, x, pos, box)
+            _, pos_ref_out = _run_net(e3, x, pos_ref, box)
+        assert rel_err(pos_ref_out - pos_ref, (pos_out - pos) @ M.T) < 1e-4  # E(3): symmetric
 
         se3 = randomize(make_network(tripp_num_layers=2, **self.NET_KW))
         with torch.no_grad():
-            _, c_out = _run_net(se3, feats, coors, L)
-            _, c_ref = _run_net(se3, feats, coors_ref, L)
-        assert rel_err(c_ref - coors_ref, (c_out - coors) @ M.T) > 1e-2  # SE(3): broken
+            _, pos_out = _run_net(se3, x, pos, box)
+            _, pos_ref_out = _run_net(se3, x, pos_ref, box)
+        assert rel_err(pos_ref_out - pos_ref, (pos_out - pos) @ M.T) > 1e-2  # SE(3): broken
