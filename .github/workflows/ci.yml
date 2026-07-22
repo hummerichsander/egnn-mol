@@ -16,15 +16,19 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install uv
         uses: astral-sh/setup-uv@v5
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
+      - name: Create virtualenv
+        # The runner's system Python is externally managed, so install into a uv venv
+        # rather than with --system.
+        run: uv venv --python ${{ matrix.python-version }}
       - name: Install
         # torch-cluster compiles against an installed torch, so install torch first and
         # build the rest without isolation.
         run: |
-          uv pip install --system torch
-          uv pip install --system --no-build-isolation -e ".[dev]"
+          uv pip install torch
+          uv pip install --no-build-isolation -e ".[dev]"
       - name: Ruff
-        run: ruff check . && ruff format --check .
+        run: |
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
       - name: Pytest
-        run: pytest -q
+        run: uv run --no-sync pytest -q

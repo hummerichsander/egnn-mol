@@ -15,16 +15,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install uv
         uses: astral-sh/setup-uv@v5
-      - name: Set up Python
-        run: uv python install 3.11
+      - name: Create virtualenv
+        run: uv venv --python 3.11
       - name: Install
         run: |
-          uv pip install --system torch
-          uv pip install --system --no-build-isolation -e ".[dev]"
+          uv pip install torch
+          uv pip install --no-build-isolation -e ".[dev]"
       - name: Message-passing parity
-        run: python benchmarks/message_passing.py | tee message_passing.txt
+        run: uv run --no-sync python benchmarks/message_passing.py | tee message_passing.txt
       - name: Backbone latency / memory
-        run: python benchmarks/backbones.py | tee backbones.txt
+        run: uv run --no-sync python benchmarks/backbones.py | tee backbones.txt
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:

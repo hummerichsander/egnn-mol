@@ -2,14 +2,20 @@
 
 Both backbones run the same radius-graph neighborhood on random open-boundary systems of growing
 size (fixed density, so the neighbor count per atom stays roughly constant). Reports median forward
-latency and peak memory (measured on CUDA; on CPU the dominant intermediate allocation is reported
-as an estimate, since the dense backbone builds an (N, N) distance matrix while the sparse backbone
-stays at O(E)). Run: ``python benchmarks/backbones.py``."""
+latency, the measured peak memory of a full forward, and the measured peak memory allocated *inside
+each message-passing layer*.
+
+Memory is measured (not estimated) on both CPU and CUDA via the PyTorch profiler: allocation events
+are replayed in time order to recover the running allocated total, whose maximum is the peak. Each
+layer is wrapped in a ``record_function`` scope so the peak can be attributed per layer.
+Run: ``python benchmarks/backbones.py``."""
 
 import json
 import time
 
 import torch
+from torch import nn
+from torch.profiler import ProfilerActivity, profile, record_function
 
 from egnn_mol import E3GNN, GeometricEGNN
 
@@ -48,14 +54,81 @@ def _time_forward(fn, device: torch.device, iters: int = 20) -> float:
     return times[len(times) // 2]
 
 
-def _peak_mb(fn, device: torch.device) -> float | None:
-    """Measured peak CUDA memory (MB) for one forward, or None on CPU."""
-    if device.type != "cuda":
-        return None
-    torch.cuda.reset_peak_memory_stats()
-    fn()
-    torch.cuda.synchronize()
-    return torch.cuda.max_memory_allocated() / 1e6
+def _hook_layers(layers: nn.ModuleList) -> list:
+    """Wrap each layer's forward in a ``record_function`` scope named ``layer{i}``.
+
+    :param layers: The backbone's message-passing layers.
+    :return: The registered hook handles (call ``.remove()`` to detach)."""
+    handles, live = [], {}
+
+    def make_pre(i):
+        def pre(_mod, _inp):
+            rf = record_function(f"layer{i}")
+            rf.__enter__()
+            live[i] = rf
+
+        return pre
+
+    def make_post(i):
+        def post(_mod, _inp, _out):
+            live.pop(i).__exit__(None, None, None)
+
+        return post
+
+    for i, layer in enumerate(layers):
+        handles.append(layer.register_forward_pre_hook(make_pre(i)))
+        handles.append(layer.register_forward_hook(make_post(i)))
+    return handles
+
+
+def _mem_field(device: torch.device) -> str:
+    """Profiler FunctionEvent attribute holding per-op net memory for this device."""
+    return (
+        "self_cuda_memory_usage" if device.type == "cuda" else "self_cpu_memory_usage"
+    )
+
+
+def _peak_memory(fn, layers: nn.ModuleList, device: torch.device) -> dict:
+    """Measured peak memory (MB) of one forward, globally and per layer.
+
+    Replays allocation events in time order: the running sum of per-op net allocations tracks the
+    live allocated bytes, and its maximum is the peak. Per-layer peaks are computed over the
+    events falling inside each layer's ``record_function`` window.
+
+    :param fn: Zero-arg callable running one forward.
+    :param layers: The backbone's message-passing layers (wrapped for attribution).
+    :param device: Device the forward runs on.
+    :return: ``{"global": MB, "per_layer": [MB, ...]}``."""
+    handles = _hook_layers(layers)
+    activities = [ProfilerActivity.CPU]
+    if device.type == "cuda":
+        activities.append(ProfilerActivity.CUDA)
+    try:
+        with profile(activities=activities, profile_memory=True) as prof:
+            fn()
+    finally:
+        for h in handles:
+            h.remove()
+
+    field = _mem_field(device)
+    events = [
+        (e.time_range.start, e.time_range.end, getattr(e, field), e.name)
+        for e in prof.events()
+    ]
+    allocs = sorted([(s, m) for s, _, m, _ in events if m], key=lambda e: e[0])
+
+    def peak_in(lo: float, hi: float) -> float:
+        run = mx = 0
+        for start, delta in allocs:
+            if lo <= start <= hi:
+                run += delta
+                mx = max(mx, run)
+        return mx / 1e6
+
+    global_peak = peak_in(float("-inf"), float("inf"))
+    scopes = {name: (s, en) for s, en, _, name in events if name.startswith("layer")}
+    per_layer = [round(peak_in(*scopes[f"layer{i}"]), 3) for i in range(len(layers))]
+    return {"global": round(global_peak, 3), "per_layer": per_layer}
 
 
 def main() -> None:
@@ -84,22 +157,29 @@ def main() -> None:
             with torch.no_grad():
                 return sparse(x, pos)
 
+        for _ in range(2):  # warmup lazy allocations before profiling
+            run_dense()
+            run_sparse()
+
         t_dense = _time_forward(run_dense, device)
         t_sparse = _time_forward(run_sparse, device)
-        # Dominant intermediate: dense builds an (N, N) float distance matrix; sparse stays O(E).
-        dense_distmat_mb = n * n * 4 / 1e6
+        mem_dense = _peak_memory(run_dense, dense.layers, device)
+        mem_sparse = _peak_memory(run_sparse, sparse.layers, device)
         row = {
             "N": n,
             "dense_ms": round(t_dense, 3),
             "sparse_ms": round(t_sparse, 3),
-            "dense_peak_mb": _peak_mb(run_dense, device),
-            "sparse_peak_mb": _peak_mb(run_sparse, device),
-            "dense_distmat_mb_est": round(dense_distmat_mb, 2),
+            "dense_peak_mb": mem_dense["global"],
+            "sparse_peak_mb": mem_sparse["global"],
+            "dense_layer_mb": mem_dense["per_layer"],
+            "sparse_layer_mb": mem_sparse["per_layer"],
         }
         rows.append(row)
         print(
-            f"N={n:5d}  dense={t_dense:8.2f} ms  sparse={t_sparse:8.2f} ms  "
-            f"(dense N^2 distance matrix ~ {dense_distmat_mb:.1f} MB)"
+            f"N={n:5d}  dense={t_dense:8.2f} ms / {mem_dense['global']:8.2f} MB  "
+            f"sparse={t_sparse:8.2f} ms / {mem_sparse['global']:7.2f} MB  "
+            f"(dense per-layer peak {max(mem_dense['per_layer']):.2f} MB, "
+            f"sparse per-layer peak {max(mem_sparse['per_layer']):.2f} MB)"
         )
 
     print("\nJSON:")

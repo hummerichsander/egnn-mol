@@ -15,13 +15,28 @@ same weights (verified by test).
 
 ## Install
 
+Not on PyPI yet — install from GitHub:
+
 ```bash
-pip install egnn-mol
+pip install "git+https://github.com/hummerichsander/egnn-mol.git"
 ```
 
-Installs everything (`torch`, `einops`, `torch-geometric`, `torch-cluster`) — both backbones are
-always available, no extras to choose. `torch-cluster` compiles against your installed `torch`; if
-your environment builds wheels in isolation, install `torch` first and add `--no-build-isolation`.
+This pulls everything (`torch`, `einops`, `torch-geometric`, `torch-cluster`) — both backbones are
+always available, no extras to choose. `torch-cluster` compiles against your installed `torch`, so
+if your environment builds wheels in isolation, install `torch` first and add `--no-build-isolation`:
+
+```bash
+pip install torch
+pip install --no-build-isolation "git+https://github.com/hummerichsander/egnn-mol.git"
+```
+
+For development, clone and install editable with the dev extra:
+
+```bash
+git clone https://github.com/hummerichsander/egnn-mol.git && cd egnn-mol
+pip install torch
+pip install --no-build-isolation -e ".[dev]"
+```
 
 ## Usage
 
@@ -169,21 +184,28 @@ boundaries and a dense minimum-image builder under periodic boundaries (`box` gi
 
 ## Performance
 
-Dense vs sparse forward latency on random open-boundary systems (fixed density, radius graph,
-`depth=4, dim=32`), from `benchmarks/backbones.py` on CPU (indicative — reproduce with the script
-or the `benchmark` CI workflow; run on GPU for peak-memory figures):
+Dense vs sparse forward latency and **measured** peak memory on random open-boundary systems (fixed
+density, radius graph, `depth=4, dim=32`), from `benchmarks/backbones.py` on CPU (indicative —
+reproduce with the script or the `benchmark` CI workflow). Memory is measured for real (not
+estimated) on both CPU and CUDA by replaying the profiler's allocation events; the benchmark also
+attributes peak memory to each message-passing layer.
 
-| N atoms | dense `E3GNN` | sparse `GeometricEGNN` | dense N×N distance matrix |
-|---:|---:|---:|---:|
-| 128 | 4.9 ms | 2.4 ms | 0.1 MB |
-| 512 | 17.7 ms | 7.4 ms | 1.0 MB |
-| 1024 | 51.4 ms | 10.7 ms | 4.2 MB |
-| 2048 | 128.4 ms | 36.0 ms | 16.8 MB |
+| N atoms | dense latency | sparse latency | dense peak mem | sparse peak mem | per-layer peak |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 3.1 ms | 2.1 ms | 0.5 MB | 0.04 MB | 0.02 MB |
+| 512 | 15.2 ms | 13.4 ms | 8.1 MB | 0.17 MB | 0.07 MB |
+| 1024 | 33.6 ms | 8.7 ms | 32.5 MB | 0.35 MB | 0.14 MB |
+| 2048 | 96.8 ms | 18.8 ms | 130.0 MB | 0.70 MB | 0.29 MB |
 
-The sparse backbone scales better: its cost grows with the number of edges `E ~ O(N)` at fixed
-density, while the dense backbone materializes an `O(N²)` distance matrix to build the
-neighborhood. Use the dense backbone for small, fixed-size systems (simpler batched tensors); use
-the sparse backbone for larger systems and ragged (variable-size) batches.
+The sparse backbone scales far better in memory: its cost grows with the number of edges
+`E ~ O(N)` at fixed density, while the dense backbone materializes an `O(N²)` distance matrix to
+build the neighborhood — its peak memory grows quadratically (0.5 MB → 130 MB from N=128 to 2048).
+
+Notably the **per-layer** peak is identical for both backbones and scales only `O(N)`: inside a
+layer both materialize the same `(E, m_dim)` message tensor. The dense backbone's memory
+disadvantage is entirely in the `O(N²)` neighborhood construction *outside* the layers, not in the
+message passing itself. Use the dense backbone for small, fixed-size systems (simpler batched
+tensors); use the sparse backbone for larger systems and ragged (variable-size) batches.
 
 The sparse layer uses a plain scatter message-pass rather than PyG's `MessagePassing`. For
 nonlinear EGNN messages the two are performance-equivalent (both materialize `(E, m_dim)` and
