@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from egnn_mol import E3GNN, GeometricEGNN
+from egnn_mol import EGNN, GeometricEGNN
 from conftest import rotation_z
 
 
@@ -159,7 +159,7 @@ def test_cross_backbone_agreement(periodic, edge_dim, tripp, graph):
         tripp_num_layers=tripp,
         distance_cutoff=distance_cutoff,
     )
-    dense = E3GNN(**common).eval()
+    dense = EGNN(**common).eval()
     sparse = GeometricEGNN(**common).eval()
     for dl, sl in zip(dense.layers, sparse.layers):
         sl.core.load_state_dict(dl.core.state_dict())

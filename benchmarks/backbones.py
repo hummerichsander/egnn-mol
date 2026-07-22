@@ -1,4 +1,4 @@
-"""Dense E3GNN vs sparse GeometricEGNN inference latency and memory across system sizes.
+"""Dense EGNN vs sparse GeometricEGNN inference latency and memory across system sizes.
 
 Both backbones run the same radius-graph neighborhood on random open-boundary systems of growing
 size (fixed density, so the neighbor count per atom stays roughly constant). Reports median forward
@@ -17,7 +17,7 @@ import torch
 from torch import nn
 from torch.profiler import ProfilerActivity, profile, record_function
 
-from egnn_mol import E3GNN, GeometricEGNN
+from egnn_mol import EGNN, GeometricEGNN
 
 SIZES = [64, 128, 256, 512, 1024, 2048]
 DIM, DEPTH, M_DIM, CUTOFF, DENSITY = (
@@ -134,7 +134,7 @@ def _peak_memory(fn, layers: nn.ModuleList, device: torch.device) -> dict:
 def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dense = (
-        E3GNN(depth=DEPTH, dim=DIM, m_dim=M_DIM, distance_cutoff=CUTOFF)
+        EGNN(depth=DEPTH, dim=DIM, m_dim=M_DIM, distance_cutoff=CUTOFF)
         .eval()
         .to(device)
     )

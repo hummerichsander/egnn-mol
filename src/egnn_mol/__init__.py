@@ -1,4 +1,4 @@
-from .dense import E3GNN
+from .dense import EGNN
 from .encodings import (
     Encoding,
     bessel,
@@ -22,7 +22,7 @@ from .sparse import (
 from .update import EquivariantUpdate
 
 __all__ = [
-    "E3GNN",
+    "EGNN",
     "GeometricEGNN",
     "SparseEGNNLayer",
     "radius_graph_pbc",

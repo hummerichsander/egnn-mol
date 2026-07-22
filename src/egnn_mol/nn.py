@@ -51,10 +51,9 @@ class PosNorm(nn.Module):
     """Normalize displacement vectors to unit length, then rescale by a learnable factor.
 
     Normalizing keeps position-update magnitudes independent of the box / bond lengths,
-    which matters under periodic boundary conditions. The dense backbone initializes the
-    scale small (near-identity updates); the sparse backbone uses ``scale_init=1.0``."""
+    which matters under periodic boundary conditions."""
 
-    def __init__(self, eps: float = 1e-8, scale_init: float = 1e-2) -> None:
+    def __init__(self, eps: float = 1e-8, scale_init: float = 1.0) -> None:
         """:param eps: Denominator clamp to avoid division by zero.
         :param scale_init: Initial value of the learnable output scale."""
         super().__init__()

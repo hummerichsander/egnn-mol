@@ -4,7 +4,7 @@ E(n)-equivariant graph neural network backbones for molecular simulation, in two
 share the same physics and the same pytorch-geometric naming (`x`, `pos`, `edge_index`,
 `edge_attr`, `batch`):
 
-- **`E3GNN`** — a dense, native-torch backbone operating on batched padded tensors `(B, N, ·)`.
+- **`EGNN`** — a dense, native-torch backbone operating on batched padded tensors `(B, N, ·)`.
   Its module uses only `torch` + `einops`.
 - **`GeometricEGNN`** — a sparse `torch_geometric` backbone operating on packed node tensors
   `(ΣN, ·)` with a `batch` vector, so it handles variable-size (ragged) graph batches.
@@ -46,9 +46,9 @@ equivariant output is `pos` — use its displacement as a velocity.
 
 ```python
 import torch
-from egnn_mol import E3GNN
+from egnn_mol import EGNN
 
-net = E3GNN(depth=4, dim=64, encoding="bessel", encoding_features=8, cutoff=1.0)
+net = EGNN(depth=4, dim=64, encoding="bessel", encoding_features=8, cutoff=1.0)
 x = torch.randn(2, 10, 64)                               # node features (B, N, dim)
 pos = torch.randn(2, 10, 3)                              # positions (B, N, 3)
 box = torch.tensor([[2.0, 2.0, 2.0], [2.5, 2.0, 1.8]])   # periodic box lengths, or omit
@@ -73,7 +73,7 @@ The `forward` methods are the primary API. Both return `(x, pos)`; only `x` and 
 required. Static edges (bonds) are optional inputs; the distance-based (dynamic) graph is
 configured at construction (`distance_cutoff` / `num_nearest_neighbors`).
 
-**`E3GNN.forward`** — dense padded tensors:
+**`EGNN.forward`** — dense padded tensors:
 
 | Argument | Shape | Description |
 |---|---|---|
@@ -114,7 +114,7 @@ All constructor arguments are keyword-only and **identical across both backbones
 | `soft_edges` | `False` | Gate each message by a learned scalar in `[0, 1]`. |
 | `norm_x` | `False` | `LayerNorm` node features before the node-feature update. |
 | `norm_pos` | `False` | Direction-normalize displacement vectors in the position update (makes the update magnitude box-/bond-length independent). |
-| `norm_pos_scale_init` | `1e-2` (dense), `1.0` (sparse) | Initial scale of the position normalizer (only used when `norm_pos=True`). |
+| `norm_pos_scale_init` | `1.0` | Initial scale of the position normalizer (only used when `norm_pos=True`). |
 | `pos_weights_clamp_value` | `None` | Optional symmetric clamp `[-c, c]` on the per-edge position weights. |
 | `tripp_num_layers` | `0` | Depth of the triple-product MLP. `> 0` enables the SE(3) chirality term (see below); `0` keeps the update E(3)-equivariant. |
 

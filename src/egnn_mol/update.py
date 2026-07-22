@@ -42,7 +42,7 @@ class EquivariantUpdate(nn.Module):
         soft_edges: bool = False,
         norm_x: bool = False,
         norm_pos: bool = False,
-        norm_pos_scale_init: float = 1e-2,
+        norm_pos_scale_init: float = 1.0,
         dropout: float = 0.0,
         pos_weights_clamp_value: float | None = None,
         tripp_num_layers: int = 0,

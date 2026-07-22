@@ -126,12 +126,12 @@ class DenseEGNNLayer(nn.Module):
         dropout: float = 0.0,
         norm_x: bool = False,
         norm_pos: bool = False,
-        norm_pos_scale_init: float = 1e-2,
+        norm_pos_scale_init: float = 1.0,
         soft_edges: bool = False,
         pos_weights_clamp_value: float | None = None,
         tripp_num_layers: int = 0,
     ) -> None:
-        """See :class:`E3GNN` for the meaning of the arguments."""
+        """See :class:`EGNN` for the meaning of the arguments."""
 
         super().__init__()
         assert aggr in {"sum", "mean"}
@@ -268,7 +268,7 @@ class DenseEGNNLayer(nn.Module):
         return edge_mask
 
 
-class E3GNN(nn.Module):
+class EGNN(nn.Module):
     """E(3)-equivariant graph neural network on dense padded tensors.
 
     Handles periodic boxes (pass ``box``) and open boundaries. The neighborhood is the union of

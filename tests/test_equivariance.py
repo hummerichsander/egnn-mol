@@ -3,7 +3,7 @@ import math
 import torch
 from torch import Tensor
 
-from egnn_mol import E3GNN
+from egnn_mol import EGNN
 from egnn_mol.dense import DenseEGNNLayer
 from conftest import rotation_z
 
@@ -19,13 +19,13 @@ def make_layer(**kwargs) -> DenseEGNNLayer:
     return DenseEGNNLayer(**defaults).eval()
 
 
-def make_network(**kwargs) -> E3GNN:
+def make_network(**kwargs) -> EGNN:
     defaults = dict(depth=2, dim=8, m_dim=8)
     defaults.update(kwargs)
-    return E3GNN(**defaults).eval()
+    return EGNN(**defaults).eval()
 
 
-def randomize(net: E3GNN, seed: int = 0) -> E3GNN:
+def randomize(net: EGNN, seed: int = 0) -> EGNN:
     """Replace parameters with non-trivial random values (near-identity init hides the SE(3) term)."""
     g = torch.Generator().manual_seed(seed)
     with torch.no_grad():
