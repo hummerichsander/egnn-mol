@@ -2,23 +2,8 @@ from typing import Literal
 
 import torch
 from torch import Tensor, nn
-
-try:
-    from torch_geometric.utils import coalesce, scatter
-except (
-    ModuleNotFoundError
-) as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError(
-        "The sparse backbone requires torch-geometric. Install it with `pip install egnn-mol[pyg]`."
-    ) from exc
-
-try:
-    from torch_cluster import knn_graph as _tc_knn_graph
-    from torch_cluster import radius_graph as _tc_radius_graph
-except (
-    ModuleNotFoundError
-):  # pragma: no cover - only the open-boundary dynamic path needs it
-    _tc_radius_graph = _tc_knn_graph = None
+from torch_cluster import knn_graph, radius_graph
+from torch_geometric.utils import coalesce, scatter
 
 from .encodings import Encoding
 from .geometry import minimum_image, signed_volume, squared_distance
@@ -107,11 +92,7 @@ def radius_edges(
 
     if box is not None:
         return radius_graph_pbc(pos, cutoff, batch, box)
-    if _tc_radius_graph is None:
-        raise ImportError(
-            "Open-boundary dynamic graphs use torch-cluster. Install `pip install egnn-mol[pyg]`."
-        )
-    return _tc_radius_graph(
+    return radius_graph(
         pos, r=cutoff, batch=batch, loop=False, max_num_neighbors=pos.shape[0]
     )
 
@@ -127,11 +108,7 @@ def knn_edges(pos: Tensor, k: int, batch: Tensor | None, box: Tensor | None) -> 
 
     if box is not None:
         return knn_graph_pbc(pos, k, batch, box)
-    if _tc_knn_graph is None:
-        raise ImportError(
-            "Open-boundary dynamic graphs use torch-cluster. Install `pip install egnn-mol[pyg]`."
-        )
-    return _tc_knn_graph(pos, k=k, batch=batch, loop=False, flow="source_to_target")
+    return knn_graph(pos, k=k, batch=batch, loop=False, flow="source_to_target")
 
 
 class SparseEGNNLayer(nn.Module):

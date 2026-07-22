@@ -17,10 +17,10 @@ jobs:
         uses: astral-sh/setup-uv@v5
       - name: Set up Python
         run: uv python install 3.11
-      - name: Install (with pyg extra)
+      - name: Install
         run: |
           uv pip install --system torch
-          uv pip install --system --no-build-isolation -e ".[dev,pyg]"
+          uv pip install --system --no-build-isolation -e ".[dev]"
       - name: Message-passing parity
         run: python benchmarks/message_passing.py | tee message_passing.txt
       - name: Backbone latency / memory

@@ -5,20 +5,23 @@ share the same physics and the same pytorch-geometric naming (`x`, `pos`, `edge_
 `edge_attr`, `batch`):
 
 - **`E3GNN`** — a dense, native-torch backbone operating on batched padded tensors `(B, N, ·)`.
-  Depends only on `torch` + `einops`.
+  Its module uses only `torch` + `einops`.
 - **`GeometricEGNN`** — a sparse `torch_geometric` backbone operating on packed node tensors
   `(ΣN, ·)` with a `batch` vector, so it handles variable-size (ragged) graph batches.
 
 Both share the same minimum-image periodicity handling, distance encodings, equivariant position
 update, and near-identity initialization — the two backbones compute the *same* function from the
-same weights (verified by test). The sparse backbone is an **optional** dependency.
+same weights (verified by test).
 
 ## Install
 
 ```bash
-pip install egnn-mol            # dense backbone + encodings (torch only)
-pip install egnn-mol[pyg]       # + the sparse backbone (torch-geometric, torch-cluster)
+pip install egnn-mol
 ```
+
+Installs everything (`torch`, `einops`, `torch-geometric`, `torch-cluster`) — both backbones are
+always available, no extras to choose. `torch-cluster` compiles against your installed `torch`; if
+your environment builds wheels in isolation, install `torch` first and add `--no-build-isolation`.
 
 ## Usage
 
@@ -38,10 +41,10 @@ x_out, pos_out = net(x, pos, box=box)
 velocity = pos_out - pos                                 # displacement is the equivariant output
 ```
 
-The sparse backbone works on packed tensors and is imported lazily (needs `torch-geometric`):
+The sparse backbone works on packed tensors:
 
 ```python
-from egnn_mol import GeometricEGNN   # actionable error if [pyg] is not installed
+from egnn_mol import GeometricEGNN
 
 net = GeometricEGNN(depth=4, dim=64, distance_cutoff=1.0)
 x = torch.randn(100, 64)          # node features (ΣN, dim)
@@ -111,8 +114,29 @@ graphs; self-loops are always excluded. With none of the three below active it i
 | `distance_cutoff` | `0.0` | If `> 0`, add a **radius graph** (all pairs within the cutoff), built internally from positions. |
 | `num_nearest_neighbors` | `0` | If `> 0`, add a **kNN graph**, built internally from positions. |
 
-Dynamic (non-bond) edges carry zero edge features; add your own channel to the static edge
-features if you need to distinguish bonds from distance edges.
+### Edge features
+
+`edge_dim > 0` gives every edge a length-`edge_dim` feature vector consumed by the edge MLP. You
+supply features for **static** edges only:
+
+- **Dense** — `edge_attr` is a dense `(B, N, N, edge_dim)` tensor; the backbone reads
+  `edge_attr[b, i, j]` for each edge (center `i`, neighbor `j`) in the neighborhood. Put your bond
+  features at the bonded pairs and leave the rest at zero.
+- **Sparse** — `edge_attr` is `(E, edge_dim)`, one row per supplied `edge_index` edge.
+
+**Dynamic edges** (radius / kNN) are generated internally from positions, so you do not supply
+their features — they get an **all-zero** `edge_dim` vector:
+
+- Sparse: each generated edge is appended with a zero row. If a generated edge coincides with a
+  static bond, the duplicate is coalesced (summed), so the bond's features are kept and the zero
+  contributes nothing.
+- Dense: a generated edge `(i, j)` reads `edge_attr[b, i, j]`; with non-bond entries left at zero
+  (the recommended convention, and what makes the two backbones agree) it is zero. You *can*
+  populate arbitrary `(i, j)` entries to give specific distance edges their own features, but the
+  sparse backbone has no such per-pair channel, so doing this breaks dense/sparse parity.
+
+To let the network distinguish bonds from distance edges, reserve one channel of `edge_dim` as a
+**bond indicator**: set it to `1` on your static bonds; dynamic edges read `0` there automatically.
 
 ### Distance encoding
 
@@ -158,7 +182,7 @@ or the `benchmark` CI workflow; run on GPU for peak-memory figures):
 
 The sparse backbone scales better: its cost grows with the number of edges `E ~ O(N)` at fixed
 density, while the dense backbone materializes an `O(N²)` distance matrix to build the
-neighborhood. Use the dense backbone for small, fixed-size systems or a torch-only dependency; use
+neighborhood. Use the dense backbone for small, fixed-size systems (simpler batched tensors); use
 the sparse backbone for larger systems and ragged (variable-size) batches.
 
 The sparse layer uses a plain scatter message-pass rather than PyG's `MessagePassing`. For

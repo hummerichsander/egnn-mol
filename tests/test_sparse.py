@@ -1,16 +1,10 @@
-import importlib.util
 import math
 
 import pytest
 import torch
 
-from egnn_mol import E3GNN, has_pyg
+from egnn_mol import E3GNN, GeometricEGNN
 from conftest import rotation_z
-
-pytestmark = pytest.mark.skipif(not has_pyg(), reason="requires torch-geometric ([pyg] extra)")
-
-_HAS_TC = importlib.util.find_spec("torch_cluster") is not None
-needs_tc = pytest.mark.skipif(not _HAS_TC, reason="open-boundary dynamic graphs need torch-cluster")
 
 
 def full_edge_index(nodes: torch.Tensor, include_self: bool) -> torch.Tensor:
@@ -38,8 +32,6 @@ def test_radius_and_knn_graph():
 
 
 def test_sparse_rotation_and_translation(compact_system):
-    from egnn_mol import GeometricEGNN
-
     x, pos, _ = compact_system
     x, pos = x[0], pos[0]  # single graph, drop batch axis
     n = pos.shape[0]
@@ -66,8 +58,6 @@ def test_sparse_rotation_and_translation(compact_system):
 
 def test_internal_graph_pbc():
     """The sparse backbone builds its own periodic graph from distance_cutoff / num_nearest."""
-    from egnn_mol import GeometricEGNN
-
     torch.manual_seed(3)
     n = 12
     x, pos = torch.randn(n, 8), torch.rand(n, 3) * 3.0
@@ -79,11 +69,8 @@ def test_internal_graph_pbc():
         assert x_out.shape == x.shape and torch.isfinite(pos_out).all()
 
 
-@needs_tc
 def test_internal_graph_open():
     """Open-boundary dynamic graph uses torch_cluster."""
-    from egnn_mol import GeometricEGNN
-
     torch.manual_seed(3)
     n = 12
     x, pos = torch.randn(n, 8), torch.rand(n, 3) * 3.0
@@ -96,8 +83,6 @@ def test_internal_graph_open():
 
 def test_static_union_dynamic():
     """Providing bonds AND a distance_cutoff unions the two edge sets (periodic path)."""
-    from egnn_mol import GeometricEGNN
-
     torch.manual_seed(4)
     n = 10
     x, pos = torch.randn(n, 8), torch.rand(n, 3) * 3.0
@@ -111,8 +96,6 @@ def test_static_union_dynamic():
 
 def test_ragged_batch_no_leakage():
     """A batch of two different-size graphs equals running each graph alone."""
-    from egnn_mol import GeometricEGNN
-
     torch.manual_seed(1)
     na, nb = 5, 8
     xa, pa = torch.randn(na, 8), torch.randn(na, 3)
@@ -158,12 +141,8 @@ def test_cross_backbone_agreement(periodic, edge_dim, tripp, graph):
 
     Swept over static-bond vs internal-radius graphs, open/periodic boundaries, edge features, and
     the E(3)/SE(3) term — the definitive proof that the two backbones implement one function."""
-    from egnn_mol import GeometricEGNN
-
     if graph == "radius" and edge_dim:
         pytest.skip("dynamic edges carry no features; edge_dim only applies to static bonds")
-    if graph == "radius" and not periodic and not _HAS_TC:
-        pytest.skip("open-boundary radius graph needs torch-cluster")
 
     torch.manual_seed(2)
     n, dim, depth = 7, 8, 2
