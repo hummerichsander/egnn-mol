@@ -21,7 +21,7 @@ except (
     ) from exc
 
 from .encodings import Encoding
-from .geometry import minimum_image, squared_distance
+from .geometry import minimum_image, signed_volume, squared_distance
 from .update import EquivariantUpdate
 
 Aggregation = Literal["sum", "mean"]
@@ -115,6 +115,7 @@ class SparseEGNNLayer(nn.Module):
         norm_coors_scale_init: float = 1.0,
         dropout: float = 0.0,
         coor_weights_clamp_value: float | None = None,
+        tripp_num_layers: int = 0,
     ) -> None:
         """See :class:`GeometricEGNN` for the shared arguments.
 
@@ -135,6 +136,7 @@ class SparseEGNNLayer(nn.Module):
             norm_coors_scale_init=norm_coors_scale_init,
             dropout=dropout,
             coor_weights_clamp_value=coor_weights_clamp_value,
+            tripp_num_layers=tripp_num_layers,
         )
 
     def forward(
@@ -164,8 +166,24 @@ class SparseEGNNLayer(nn.Module):
 
         m_ij = self.core.message(feats[dst], feats[src], dist, edge_attr)
 
-        delta = self.core.coord_delta(m_ij, rel)
-        coors_out = coors + scatter(delta, dst, dim=0, dim_size=n, reduce="sum")
+        normed = self.core.normalize_rel(rel)
+        if self.core.tripp:
+            abc = self.core.triple_abc(m_ij)  # (E, 3)
+            v = torch.stack(
+                [
+                    scatter(abc[:, k : k + 1] * normed, dst, dim=0, dim_size=n)
+                    for k in range(3)
+                ],
+                dim=1,
+            )  # (N, 3=k, 3=xyz)
+            chi = signed_volume(v[:, 0], v[:, 1], v[:, 2])  # (N, 1)
+            weight = self.core.coord_weight(m_ij, chi[dst], chi[src])
+        else:
+            weight = self.core.coord_weight(m_ij)
+
+        coors_out = coors + scatter(
+            weight * normed, dst, dim=0, dim_size=n, reduce="sum"
+        )
 
         m_pooled = scatter(m_ij, dst, dim=0, dim_size=n, reduce=self.aggr)
         feats_out = self.core.update_feats(feats, m_pooled)

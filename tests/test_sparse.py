@@ -92,24 +92,50 @@ def test_ragged_batch_no_leakage():
     assert torch.allclose(out[na:], out_b, atol=1e-5)
 
 
-def test_cross_backbone_agreement():
-    """Dense (all-pairs incl. self) and sparse (same graph) agree when they share weights."""
+@pytest.mark.parametrize("periodic", [False, True])
+@pytest.mark.parametrize("edge_dim", [0, 3])
+@pytest.mark.parametrize("tripp", [0, 2])
+def test_cross_backbone_agreement(periodic, edge_dim, tripp):
+    """Dense (all-pairs incl. self) and sparse (same graph) agree exactly with shared weights.
+
+    Swept over open/periodic boundaries, presence of edge features, and the E(3)/SE(3) term —
+    the definitive proof that the two backbones implement the same function."""
     from egnn_mol import GeometricEGNN
 
     torch.manual_seed(2)
-    n = 7
-    coors = torch.randn(n, 3)
-    feats = torch.randn(n, 8)
+    n, dim, depth = 7, 8, 2
+    coors = torch.rand(n, 3) * 4.0
+    feats = torch.randn(n, dim)
+    box = torch.tensor([4.0, 4.5, 3.5]) if periodic else None
 
-    dense = E3GNN(depth=1, dim=8, m_dim=8).eval()
-    sparse = GeometricEGNN(depth=1, dim=8, m_dim=8).eval()
-    sparse.layers[0].core.load_state_dict(dense.layers[0].core.state_dict())
+    dense = E3GNN(
+        depth=depth, dim=dim, m_dim=8, edge_dim=edge_dim, tripp_num_layers=tripp
+    ).eval()
+    sparse = GeometricEGNN(
+        depth=depth, dim=dim, m_dim=8, edge_dim=edge_dim, tripp_num_layers=tripp
+    ).eval()
+    for dl, sl in zip(dense.layers, sparse.layers):
+        sl.core.load_state_dict(dl.core.state_dict())
 
     edge_index = full_edge_index(torch.arange(n), include_self=True)
+    dst, src = edge_index[1], edge_index[0]
+
+    dense_edges = sparse_edge_attr = None
+    if edge_dim:
+        dense_edges = torch.randn(1, n, n, edge_dim)
+        sparse_edge_attr = dense_edges[0, dst, src]  # (E, edge_dim): dense[b, i=center, j=neighbor]
+
+    dense_box = box[None] if periodic else None
+    sparse_box = box.expand(n, 3) if periodic else None
 
     with torch.no_grad():
-        f_d, c_d = dense(feats[None], coors[None])
-        out_s = sparse(torch.cat([coors, feats], -1), edge_index)
+        f_d, c_d = dense(feats[None], coors[None], dense_box, edges=dense_edges)
+        out_s = sparse(
+            torch.cat([coors, feats], -1),
+            edge_index,
+            edge_attr=sparse_edge_attr,
+            unitcell_lengths=sparse_box,
+        )
 
     assert torch.allclose(c_d[0], out_s[:, :3], atol=1e-5)
     assert torch.allclose(f_d[0], out_s[:, 3:], atol=1e-5)

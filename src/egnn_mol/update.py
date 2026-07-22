@@ -8,10 +8,10 @@ learnable piece and the distance-encoding choice, and exposes three aggregation-
 reduce the per-pair outputs back to nodes.
 
 The update is E(3)-equivariant (features depend only on invariants; coordinate updates are linear
-combinations of relative-coordinate vectors). The optional SE(3) triple-product term of the
-original sparse backbone is not reproduced here: it needs graph-level aggregation rather than a
-pure per-pair op and is unused by current configs. :func:`egnn_mol.geometry.signed_volume` is
-provided for adding it later."""
+combinations of relative-coordinate vectors). With ``tripp_num_layers > 0`` it additionally emits
+per-node chirality scalars (via :func:`egnn_mol.geometry.signed_volume`) that feed the coordinate
+head, reducing the symmetry to SE(3). Those scalars need a graph-level reduction, so the backbones
+compute them with their own gather/scatter and pass them back through :meth:`coord_weight`."""
 
 import torch
 from torch import Tensor, nn
@@ -60,6 +60,7 @@ class EquivariantUpdate(nn.Module):
         norm_coors_scale_init: float = 1e-2,
         dropout: float = 0.0,
         coor_weights_clamp_value: float | None = None,
+        tripp_num_layers: int = 0,
     ) -> None:
         """Build the update.
 
@@ -74,13 +75,16 @@ class EquivariantUpdate(nn.Module):
         :param norm_coors: Normalize displacement vectors in the coordinate update.
         :param norm_coors_scale_init: Initial scale of :class:`CoorsNorm`.
         :param dropout: Dropout probability inside the MLPs.
-        :param coor_weights_clamp_value: Optional symmetric clamp on coordinate weights."""
+        :param coor_weights_clamp_value: Optional symmetric clamp on coordinate weights.
+        :param tripp_num_layers: Depth of the triple-product MLP; > 0 turns on the SE(3)
+            chirality term (0 keeps the update E(3)-equivariant)."""
 
         super().__init__()
         self.encoding = encoding
         self.encoding_features = encoding_features
         self.cutoff = cutoff
         self.coor_weights_clamp_value = coor_weights_clamp_value
+        self.tripp = tripp_num_layers > 0
 
         dist_width = encoding_width(encoding, encoding_features)
         edge_input_dim = dim * 2 + dist_width + edge_dim
@@ -99,14 +103,25 @@ class EquivariantUpdate(nn.Module):
         self.node_norm = nn.LayerNorm(dim) if norm_feats else nn.Identity()
         self.node_mlp = MLP(dim + m_dim, dim * 2, dim, dropout=dropout)
 
-        self.coors_mlp = MLP(m_dim, m_dim * 4, 1, dropout=dropout)
+        # With the triple-product term the coordinate head also sees the chirality scalar of
+        # both endpoints, so its input widens by 2.
+        self.coors_mlp = MLP(
+            m_dim + (2 if self.tripp else 0), m_dim * 4, 1, dropout=dropout
+        )
         self.coors_norm = (
             CoorsNorm(scale_init=norm_coors_scale_init) if norm_coors else nn.Identity()
+        )
+        self.triple_mlp = (
+            MLP(m_dim, m_dim, 3, num_layers=tripp_num_layers, dropout=dropout)
+            if self.tripp
+            else None
         )
 
         _init_mlp(self.edge_mlp)
         _init_mlp(self.node_mlp)
         _init_coord_head(self.coors_mlp)
+        if self.triple_mlp is not None:
+            _init_mlp(self.triple_mlp)
 
     def message(
         self,
@@ -132,18 +147,41 @@ class EquivariantUpdate(nn.Module):
             m_ij = m_ij * self.edge_gate(m_ij)
         return m_ij
 
-    def coord_delta(self, m_ij: Tensor, rel_coors: Tensor) -> Tensor:
-        """Per-pair coordinate contributions; the caller masks padded pairs and reduces to nodes.
+    def normalize_rel(self, rel_coors: Tensor) -> Tensor:
+        """Direction-normalize relative coordinates (identity if ``norm_coors`` is off).
+
+        :param rel_coors: Relative coordinates (P, 3), already minimum-image wrapped.
+        :return: Normalized relative coordinates (P, 3)."""
+
+        return self.coors_norm(rel_coors)
+
+    def triple_abc(self, m_ij: Tensor) -> Tensor:
+        """Per-pair scalar weights for the three chirality vector fields (SE(3) term only).
 
         :param m_ij: Messages (P, m_dim).
-        :param rel_coors: Relative coordinates (P, 3), already minimum-image wrapped.
-        :return: Coordinate contributions (P, 3)."""
+        :return: Three scalar weights per pair (P, 3)."""
 
-        weight = self.coors_mlp(m_ij)
+        return self.triple_mlp(m_ij)
+
+    def coord_weight(
+        self, m_ij: Tensor, chi_i: Tensor | None = None, chi_j: Tensor | None = None
+    ) -> Tensor:
+        """Per-pair scalar coordinate weight.
+
+        With the triple-product term the per-node chirality scalars of both endpoints are
+        appended to the message before the coordinate head.
+
+        :param m_ij: Messages (P, m_dim).
+        :param chi_i: Chirality scalar of the target node, gathered per pair (P, 1); only with SE(3).
+        :param chi_j: Chirality scalar of the source node, gathered per pair (P, 1); only with SE(3).
+        :return: Coordinate weights (P, 1)."""
+
+        inp = torch.cat([m_ij, chi_i, chi_j], dim=-1) if self.tripp else m_ij
+        weight = self.coors_mlp(inp)
         if self.coor_weights_clamp_value is not None:
             c = self.coor_weights_clamp_value
             weight = weight.clamp(min=-c, max=c)
-        return weight * self.coors_norm(rel_coors)
+        return weight
 
     def update_feats(self, feats: Tensor, m_pooled: Tensor) -> Tensor:
         """Residual node-feature update from already-reduced messages.

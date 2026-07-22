@@ -8,7 +8,7 @@ import importlib
 import importlib.util
 from typing import TYPE_CHECKING
 
-from .dense import E3GNN, E3GNNPeriodic, PeriodicE3GNN
+from .dense import E3GNN
 from .encodings import (
     Encoding,
     bessel,
@@ -28,8 +28,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "E3GNN",
-    "E3GNNPeriodic",
-    "PeriodicE3GNN",
     "GeometricEGNN",
     "SparseEGNNLayer",
     "radius_graph_pbc",

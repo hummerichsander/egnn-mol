@@ -11,7 +11,7 @@ from torch import Tensor, nn
 from einops import rearrange, repeat
 
 from .encodings import Encoding
-from .geometry import minimum_image, squared_distance
+from .geometry import minimum_image, signed_volume, squared_distance
 from .update import EquivariantUpdate
 
 
@@ -139,6 +139,7 @@ class DenseEGNNLayer(nn.Module):
         norm_coors_scale_init: float = 1e-2,
         soft_edges: bool = False,
         coor_weights_clamp_value: float | None = None,
+        tripp_num_layers: int = 0,
     ) -> None:
         """See :class:`E3GNN` for the meaning of the shared arguments.
 
@@ -167,6 +168,7 @@ class DenseEGNNLayer(nn.Module):
             norm_coors_scale_init=norm_coors_scale_init,
             dropout=dropout,
             coor_weights_clamp_value=coor_weights_clamp_value,
+            tripp_num_layers=tripp_num_layers,
         )
 
     def forward(
@@ -238,7 +240,28 @@ class DenseEGNNLayer(nn.Module):
         if nbhd_mask is not None:
             edge_mask = nbhd_mask if edge_mask is None else (edge_mask & nbhd_mask)
 
-        delta = self.core.coord_delta(m_ij, rel_coors)
+        normed = self.core.normalize_rel(rel_coors)
+
+        if self.core.tripp:
+            abc = self.core.triple_abc(m_ij)  # (B, N, K, 3)
+            weighted = abc.unsqueeze(-1) * normed.unsqueeze(-2)  # (B, N, K, 3=k, 3=xyz)
+            if edge_mask is not None:
+                weighted = weighted.masked_fill(
+                    ~rearrange(edge_mask, "... -> ... () ()"), 0.0
+                )
+            v = weighted.sum(dim=2)  # (B, N, 3=k, 3=xyz)
+            chi = signed_volume(v[..., 0, :], v[..., 1, :], v[..., 2, :])  # (B, N, 1)
+            chi_i = rearrange(chi, "b i one -> b i () one")
+            if nbhd_indices is not None:
+                chi_j = batched_index_select(chi, nbhd_indices, dim=1)
+            else:
+                chi_j = rearrange(chi, "b j one -> b () j one")
+            chi_i, chi_j = torch.broadcast_tensors(chi_i, chi_j)
+            weight = self.core.coord_weight(m_ij, chi_i, chi_j)
+        else:
+            weight = self.core.coord_weight(m_ij)
+
+        delta = weight * normed
         if edge_mask is not None:
             delta = delta.masked_fill(~rearrange(edge_mask, "... -> ... ()"), 0.0)
         coors_out = coors + delta.sum(dim=2)
@@ -275,62 +298,25 @@ class E3GNN(nn.Module):
         encoding: Encoding = "bessel",
         encoding_features: int = 8,
         cutoff: float = 10.0,
-        num_tokens: int | None = None,
-        num_edge_tokens: int | None = None,
-        num_positions: int | None = None,
         edge_dim: int = 0,
-        num_adj_degrees: int | None = None,
-        adj_dim: int = 0,
         distance_cutoff: float = 0.0,
         **kwargs,
     ) -> None:
         """Build the network.
 
         :param depth: Number of message-passing layers.
-        :param dim: Node feature dimensionality.
+        :param dim: Node feature dimensionality (features must already be this wide).
         :param encoding: Radial distance encoding for every layer.
         :param encoding_features: Number of basis functions / frequency bands for the encoding.
         :param cutoff: Radial length scale of the encoding.
-        :param num_tokens: Vocabulary size for an optional node-token embedding.
-        :param num_edge_tokens: Vocabulary size for an optional edge-token embedding.
-        :param num_positions: Number of positions for an optional positional embedding.
         :param edge_dim: Edge-feature dimensionality (0 if no edge features).
-        :param num_adj_degrees: Number of adjacency degrees to embed, or None.
-        :param adj_dim: Embedding dimensionality for adjacency degrees.
         :param distance_cutoff: If > 0, add within-cutoff edges to the graph.
         :param kwargs: Extra keyword arguments forwarded to every :class:`DenseEGNNLayer`."""
 
         super().__init__()
-        assert not (num_adj_degrees is not None and num_adj_degrees < 1), (
-            "num_adj_degrees must be at least 1"
-        )
-        self.num_positions = num_positions
         self.distance_cutoff = distance_cutoff
-
-        self.token_emb = (
-            nn.Embedding(num_tokens, dim) if num_tokens is not None else None
-        )
-        self.pos_emb = (
-            nn.Embedding(num_positions, dim) if num_positions is not None else None
-        )
-        self.edge_emb = (
-            nn.Embedding(num_edge_tokens, edge_dim)
-            if num_edge_tokens is not None
-            else None
-        )
-        self.has_edges = edge_dim > 0
-
-        self.num_adj_degrees = num_adj_degrees
-        self.adj_emb = (
-            nn.Embedding(num_adj_degrees + 1, adj_dim)
-            if num_adj_degrees is not None and adj_dim > 0
-            else None
-        )
-
-        edge_dim = edge_dim if self.has_edges else 0
-        adj_dim = adj_dim if num_adj_degrees is not None else 0
         # +1 for the within-cutoff flag column appended to the edge features at forward time.
-        layer_edge_dim = edge_dim + adj_dim + (1 if distance_cutoff > 0 else 0)
+        layer_edge_dim = edge_dim + (1 if distance_cutoff > 0 else 0)
 
         self.layers = nn.ModuleList(
             [
@@ -358,53 +344,14 @@ class E3GNN(nn.Module):
     ):
         """Run all message-passing layers.
 
-        :param feats: Node features (B, N, D), or token ids if ``num_tokens`` is set.
+        :param feats: Node features (B, N, D).
         :param coors: Node coordinates (B, N, 3).
         :param unitcell_lengths: Periodic box lengths (B, 3), or None.
         :param adj_mat: Boolean adjacency (B, N, N) or (N, N), or None.
-        :param edges: Edge features (B, N, N, E) or edge token ids, or None.
+        :param edges: Edge features (B, N, N, E), or None.
         :param mask: Node validity mask (B, N), or None.
         :param return_coor_changes: If True, also return the coordinate trajectory.
         :return: ``(feats, coors)`` or ``(feats, coors, coor_changes)``."""
-
-        b, device = feats.shape[0], feats.device
-
-        if self.token_emb is not None:
-            feats = self.token_emb(feats)
-
-        if self.pos_emb is not None and self.num_positions is not None:
-            n = feats.shape[1]
-            assert n <= self.num_positions, (
-                f"sequence length {n} exceeds num_positions {self.num_positions}"
-            )
-            pos_emb = self.pos_emb(torch.arange(n, device=device))
-            feats = feats + rearrange(pos_emb, "n d -> () n d")
-
-        if edges is not None and self.edge_emb is not None:
-            edges = self.edge_emb(edges)
-
-        if self.num_adj_degrees is not None:
-            assert adj_mat is not None, (
-                "adj_mat must be passed when num_adj_degrees is set"
-            )
-            if adj_mat.dim() == 2:
-                adj_mat = repeat(adj_mat.clone(), "i j -> b i j", b=b)
-            adj_indices = adj_mat.clone().long()
-            for ind in range(self.num_adj_degrees - 1):
-                degree = ind + 2
-                next_degree_adj_mat = (adj_mat.float() @ adj_mat.float()) > 0
-                next_degree_mask = (
-                    next_degree_adj_mat.float() - adj_mat.float()
-                ).bool()
-                adj_indices.masked_fill_(next_degree_mask, degree)
-                adj_mat = next_degree_adj_mat.clone()
-            if self.adj_emb is not None:
-                adj_emb = self.adj_emb(adj_indices)
-                edges = (
-                    torch.cat((edges, adj_emb), dim=-1)
-                    if edges is not None
-                    else adj_emb
-                )
 
         # Build the neighborhood once and share it. The distance pass only selects edges, so it
         # runs under no_grad and is not part of the backward graph.
@@ -472,8 +419,3 @@ class E3GNN(nn.Module):
         if return_coor_changes:
             return feats, coors, coor_changes
         return feats, coors
-
-
-# Aliases for drop-in compatibility with the split-flows periodic backbone.
-E3GNNPeriodic = E3GNN
-PeriodicE3GNN = E3GNN

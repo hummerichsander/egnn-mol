@@ -25,6 +25,12 @@ Radial distance encodings are plain functions selected by name — `"bessel"` (D
 Bessel basis), `"fourier"` (sinusoidal bands), `"gaussian"` (fixed-center RBF). Adding one is a
 single function plus a `match` arm in `egnn_mol/encodings.py`.
 
+## E(3) vs SE(3)
+
+By default the backbones are E(3)-equivariant. Passing `tripp_num_layers > 0` adds a
+triple-product (chirality) term that makes the update SE(3)-equivariant — sensitive to
+reflections — which is useful for chiral molecules.
+
 ## Usage
 
 ```python
