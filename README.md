@@ -1,8 +1,8 @@
 # egnn-mol
 
 E(n)-equivariant graph neural network backbones for molecular simulation, in two flavours that
-share the same physics and the same pytorch-geometric naming (`x`, `pos`, `edge_index`,
-`edge_attr`, `batch`):
+share the same physics and naming — `x` = node **positions**, `h_node` = node features,
+`h_edge` = edge features, `edge_index` = connectivity, `batch` = graph membership:
 
 - **`EGNN`** — a dense, native-torch backbone operating on batched padded tensors `(B, N, ·)`.
   Its module uses only `torch` + `einops`.
@@ -40,20 +40,20 @@ pip install --no-build-isolation -e ".[dev]"
 
 ## Usage
 
-Both backbones take node features `x` and positions `pos` separately, and expect `x` already
-projected to `dim` (embed atom types / time / etc. upstream). Both **return `(x, pos)`**; the
-equivariant output is `pos` — use its displacement as a velocity.
+Both backbones take node features `h_node` and positions `x` separately, and expect `h_node`
+already projected to `dim` (embed atom types / time / etc. upstream). Both **return `(h_node, x)`**;
+the equivariant output is `x` — use its displacement as a velocity.
 
 ```python
 import torch
 from egnn_mol import EGNN
 
 net = EGNN(depth=4, dim=64, encoding="bessel", encoding_features=8, cutoff=1.0)
-x = torch.randn(2, 10, 64)                               # node features (B, N, dim)
-pos = torch.randn(2, 10, 3)                              # positions (B, N, 3)
+h_node = torch.randn(2, 10, 64)                          # node features (B, N, dim)
+x = torch.randn(2, 10, 3)                                # positions (B, N, 3)
 box = torch.tensor([[2.0, 2.0, 2.0], [2.5, 2.0, 1.8]])   # periodic box lengths, or omit
-x_out, pos_out = net(x, pos, box=box)
-velocity = pos_out - pos                                 # displacement is the equivariant output
+h_node_out, x_out = net(h_node, x, box=box)
+velocity = x_out - x                                     # displacement is the equivariant output
 ```
 
 The sparse backbone works on packed tensors:
@@ -62,14 +62,14 @@ The sparse backbone works on packed tensors:
 from egnn_mol import GeometricEGNN
 
 net = GeometricEGNN(depth=4, dim=64, distance_cutoff=1.0)
-x = torch.randn(100, 64)          # node features (ΣN, dim)
-pos = torch.randn(100, 3)         # positions (ΣN, 3)
-x_out, pos_out = net(x, pos, batch=batch)   # edge_index optional; radius graph built internally
+h_node = torch.randn(100, 64)     # node features (ΣN, dim)
+x = torch.randn(100, 3)           # positions (ΣN, 3)
+h_node_out, x_out = net(h_node, x, batch=batch)   # edge_index optional; radius graph built internally
 ```
 
 ## Forward API
 
-The `forward` methods are the primary API. Both return `(x, pos)`; only `x` and `pos` are
+The `forward` methods are the primary API. Both return `(h_node, x)`; only `h_node` and `x` are
 required. Static edges (bonds) are optional inputs; the distance-based (dynamic) graph is
 configured at construction (`distance_cutoff` / `num_nearest_neighbors`).
 
@@ -77,22 +77,22 @@ configured at construction (`distance_cutoff` / `num_nearest_neighbors`).
 
 | Argument | Shape | Description |
 |---|---|---|
-| `x` | `(B, N, dim)` | Node features. |
-| `pos` | `(B, N, 3)` | Node positions. |
+| `h_node` | `(B, N, dim)` | Node features. |
+| `x` | `(B, N, 3)` | Node positions. |
 | `adj_mat` | `(B, N, N)` or `(N, N)`, or `None` | Static bond adjacency (bool). |
-| `edge_attr` | `(B, N, N, edge_dim)`, or `None` | Static edge features. |
+| `h_edge` | `(B, N, N, edge_dim)`, or `None` | Static edge features. |
 | `mask` | `(B, N)`, or `None` | Node validity mask (padding). |
 | `box` | `(B, 3)`, or `None` | Periodic box lengths (`None` = open boundaries). |
-| `return_pos_changes` | bool | Also return the per-layer position trajectory. |
+| `return_x_changes` | bool | Also return the per-layer position trajectory. |
 
 **`GeometricEGNN.forward`** — packed graph tensors:
 
 | Argument | Shape | Description |
 |---|---|---|
-| `x` | `(ΣN, dim)` | Node features. |
-| `pos` | `(ΣN, 3)` | Node positions. |
+| `h_node` | `(ΣN, dim)` | Node features. |
+| `x` | `(ΣN, 3)` | Node positions. |
 | `edge_index` | `(2, E)`, or `None` | Static bonds, `[source/neighbor, target/center]`. |
-| `edge_attr` | `(E, edge_dim)`, or `None` | Static edge features. |
+| `h_edge` | `(E, edge_dim)`, or `None` | Static edge features. |
 | `batch` | `(ΣN,)`, or `None` | Graph membership for a ragged batch. |
 | `box` | `(ΣN, 3)`, or `None` | Per-node periodic box lengths (`None` = open). |
 
@@ -112,10 +112,10 @@ All constructor arguments are keyword-only and **identical across both backbones
 | `aggr` | `"sum"` | Message aggregation onto nodes: `"sum"` or `"mean"`. |
 | `dropout` | `0.0` | Dropout probability inside the layer MLPs. |
 | `soft_edges` | `False` | Gate each message by a learned scalar in `[0, 1]`. |
-| `norm_x` | `False` | `LayerNorm` node features before the node-feature update. |
-| `norm_pos` | `False` | Direction-normalize displacement vectors in the position update (makes the update magnitude box-/bond-length independent). |
-| `norm_pos_scale_init` | `1.0` | Initial scale of the position normalizer (only used when `norm_pos=True`). |
-| `pos_weights_clamp_value` | `None` | Optional symmetric clamp `[-c, c]` on the per-edge position weights. |
+| `norm_h_node` | `False` | `LayerNorm` node features before the node-feature update. |
+| `norm_displacement` | `False` | Direction-normalize displacement vectors in the position update (makes the update magnitude box-/bond-length independent). |
+| `norm_displacement_scale_init` | `1.0` | Initial scale of the `DisplacementNorm` (only used when `norm_displacement=True`). |
+| `x_weights_clamp_value` | `None` | Optional symmetric clamp `[-c, c]` on the per-edge position weights. |
 | `tripp_num_layers` | `0` | Depth of the triple-product MLP. `> 0` enables the SE(3) chirality term (see below); `0` keeps the update E(3)-equivariant. |
 
 ### Neighborhood — static edges ∪ dynamic edges
@@ -125,7 +125,7 @@ graphs; self-loops are always excluded. With none of the three below active it i
 
 | Name | Default | Description |
 |---|---|---|
-| static edges | *(forward input)* | Molecular bonds, passed at call time — dense `adj_mat`/`edge_attr`, sparse `edge_index`/`edge_attr`. |
+| static edges | *(forward input)* | Molecular bonds, passed at call time — dense `adj_mat`/`h_edge`, sparse `edge_index`/`h_edge`. |
 | `distance_cutoff` | `0.0` | If `> 0`, add a **radius graph** (all pairs within the cutoff), built internally from positions. |
 | `num_nearest_neighbors` | `0` | If `> 0`, add a **kNN graph**, built internally from positions. |
 
@@ -134,10 +134,10 @@ graphs; self-loops are always excluded. With none of the three below active it i
 `edge_dim > 0` gives every edge a length-`edge_dim` feature vector consumed by the edge MLP. You
 supply features for **static** edges only:
 
-- **Dense** — `edge_attr` is a dense `(B, N, N, edge_dim)` tensor; the backbone reads
-  `edge_attr[b, i, j]` for each edge (center `i`, neighbor `j`) in the neighborhood. Put your bond
+- **Dense** — `h_edge` is a dense `(B, N, N, edge_dim)` tensor; the backbone reads
+  `h_edge[b, i, j]` for each edge (center `i`, neighbor `j`) in the neighborhood. Put your bond
   features at the bonded pairs and leave the rest at zero.
-- **Sparse** — `edge_attr` is `(E, edge_dim)`, one row per supplied `edge_index` edge.
+- **Sparse** — `h_edge` is `(E, edge_dim)`, one row per supplied `edge_index` edge.
 
 **Dynamic edges** (radius / kNN) are generated internally from positions, so you do not supply
 their features — they get an **all-zero** `edge_dim` vector:
@@ -145,7 +145,7 @@ their features — they get an **all-zero** `edge_dim` vector:
 - Sparse: each generated edge is appended with a zero row. If a generated edge coincides with a
   static bond, the duplicate is coalesced (summed), so the bond's features are kept and the zero
   contributes nothing.
-- Dense: a generated edge `(i, j)` reads `edge_attr[b, i, j]`; with non-bond entries left at zero
+- Dense: a generated edge `(i, j)` reads `h_edge[b, i, j]`; with non-bond entries left at zero
   (the recommended convention, and what makes the two backbones agree) it is zero. You *can*
   populate arbitrary `(i, j)` entries to give specific distance edges their own features, but the
   sparse backbone has no such per-pair channel, so doing this breaks dense/sparse parity.
@@ -175,7 +175,7 @@ preserved; reflection equivariance is intentionally broken.
 ## Periodic boundary conditions
 
 Pass `box` (orthorhombic box lengths) to wrap displacement vectors with the minimum-image
-convention; omit it for open boundaries. Only the *displacement* (`pos_out - pos`) is periodic —
+convention; omit it for open boundaries. Only the *displacement* (`x_out - x`) is periodic —
 use it as the velocity, not the raw output positions.
 
 **Dynamic-graph construction** uses `torch_cluster` (`radius_graph`/`knn_graph`) for open

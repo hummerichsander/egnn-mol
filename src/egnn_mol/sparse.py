@@ -13,7 +13,7 @@ Aggregation = Literal["sum", "mean"]
 
 
 def radius_graph_pbc(
-    pos: Tensor,
+    x: Tensor,
     cutoff: float,
     batch: Tensor | None = None,
     box: Tensor | None = None,
@@ -24,30 +24,30 @@ def radius_graph_pbc(
     Uses a dense ``(N, N)`` pairwise pass, so it is intended for small systems (the typical
     periodic ``distance_cutoff`` use case); it is not a linear-scaling neighbor list.
 
-    :param pos: Node positions (N, 3).
+    :param x: Node positions (N, 3).
     :param cutoff: Distance cutoff.
     :param batch: Graph membership (N,), or None for a single graph.
     :param box: Per-node box lengths (N, 3), or None for open boundaries.
     :param include_self: Whether to keep self-loops.
     :return: Edge index (2, E) with the convention ``[source/neighbor, target/center]``."""
 
-    n = pos.shape[0]
+    n = x.shape[0]
     if batch is None:
-        batch = torch.zeros(n, dtype=torch.long, device=pos.device)
+        batch = torch.zeros(n, dtype=torch.long, device=x.device)
 
-    rel = pos[:, None, :] - pos[None, :, :]
+    rel = x[:, None, :] - x[None, :, :]
     rel = minimum_image(rel, box[:, None, :] if box is not None else None)
     dist_sq = (rel**2).sum(dim=-1)
     within = (batch[:, None] == batch[None, :]) & (dist_sq < cutoff**2)
     if not include_self:
-        within = within & ~torch.eye(n, dtype=torch.bool, device=pos.device)
+        within = within & ~torch.eye(n, dtype=torch.bool, device=x.device)
 
     center, neighbor = within.nonzero(as_tuple=True)
     return torch.stack([neighbor, center], dim=0)
 
 
 def knn_graph_pbc(
-    pos: Tensor,
+    x: Tensor,
     k: int,
     batch: Tensor | None = None,
     box: Tensor | None = None,
@@ -56,17 +56,17 @@ def knn_graph_pbc(
 
     Dense ``(N, N)`` pairwise pass — intended for small systems.
 
-    :param pos: Node positions (N, 3).
+    :param x: Node positions (N, 3).
     :param k: Number of nearest neighbors per node.
     :param batch: Graph membership (N,), or None for a single graph.
     :param box: Per-node box lengths (N, 3), or None for open boundaries.
     :return: Edge index (2, E) with the convention ``[source/neighbor, target/center]``."""
 
-    n = pos.shape[0]
+    n = x.shape[0]
     if batch is None:
-        batch = torch.zeros(n, dtype=torch.long, device=pos.device)
+        batch = torch.zeros(n, dtype=torch.long, device=x.device)
 
-    rel = pos[:, None, :] - pos[None, :, :]
+    rel = x[:, None, :] - x[None, :, :]
     rel = minimum_image(rel, box[:, None, :] if box is not None else None)
     dist_sq = (rel**2).sum(dim=-1)
     same_graph = batch[:, None] == batch[None, :]
@@ -75,40 +75,40 @@ def knn_graph_pbc(
 
     k = min(k, n)
     neighbor = dist_sq.topk(k, dim=-1, largest=False).indices  # (N, k)
-    center = torch.arange(n, device=pos.device)[:, None].expand(-1, k)
+    center = torch.arange(n, device=x.device)[:, None].expand(-1, k)
     return torch.stack([neighbor.reshape(-1), center.reshape(-1)], dim=0)
 
 
 def radius_edges(
-    pos: Tensor, cutoff: float, batch: Tensor | None, box: Tensor | None
+    x: Tensor, cutoff: float, batch: Tensor | None, box: Tensor | None
 ) -> Tensor:
     """Radius graph: minimum-image dense pass under PBC (``box`` given), else ``torch_cluster``.
 
-    :param pos: Node positions (N, 3).
+    :param x: Node positions (N, 3).
     :param cutoff: Distance cutoff.
     :param batch: Graph membership (N,), or None.
     :param box: Per-node box lengths (N, 3) for PBC, or None for open boundaries.
     :return: Edge index (2, E), ``[source/neighbor, target/center]``."""
 
     if box is not None:
-        return radius_graph_pbc(pos, cutoff, batch, box)
+        return radius_graph_pbc(x, cutoff, batch, box)
     return radius_graph(
-        pos, r=cutoff, batch=batch, loop=False, max_num_neighbors=pos.shape[0]
+        x, r=cutoff, batch=batch, loop=False, max_num_neighbors=x.shape[0]
     )
 
 
-def knn_edges(pos: Tensor, k: int, batch: Tensor | None, box: Tensor | None) -> Tensor:
+def knn_edges(x: Tensor, k: int, batch: Tensor | None, box: Tensor | None) -> Tensor:
     """kNN graph: minimum-image dense pass under PBC (``box`` given), else ``torch_cluster``.
 
-    :param pos: Node positions (N, 3).
+    :param x: Node positions (N, 3).
     :param k: Number of nearest neighbors per node.
     :param batch: Graph membership (N,), or None.
     :param box: Per-node box lengths (N, 3) for PBC, or None for open boundaries.
     :return: Edge index (2, E), ``[source/neighbor, target/center]``."""
 
     if box is not None:
-        return knn_graph_pbc(pos, k, batch, box)
-    return knn_graph(pos, k=k, batch=batch, loop=False, flow="source_to_target")
+        return knn_graph_pbc(x, k, batch, box)
+    return knn_graph(x, k=k, batch=batch, loop=False, flow="source_to_target")
 
 
 class SparseEGNNLayer(nn.Module):
@@ -125,11 +125,11 @@ class SparseEGNNLayer(nn.Module):
         edge_dim: int = 0,
         aggr: Aggregation = "sum",
         soft_edges: bool = False,
-        norm_x: bool = False,
-        norm_pos: bool = False,
-        norm_pos_scale_init: float = 1.0,
+        norm_h_node: bool = False,
+        norm_displacement: bool = False,
+        norm_displacement_scale_init: float = 1.0,
         dropout: float = 0.0,
-        pos_weights_clamp_value: float | None = None,
+        x_weights_clamp_value: float | None = None,
         tripp_num_layers: int = 0,
     ) -> None:
         """See :class:`GeometricEGNN` for the shared arguments.
@@ -146,42 +146,40 @@ class SparseEGNNLayer(nn.Module):
             m_dim=m_dim,
             edge_dim=edge_dim,
             soft_edges=soft_edges,
-            norm_x=norm_x,
-            norm_pos=norm_pos,
-            norm_pos_scale_init=norm_pos_scale_init,
+            norm_h_node=norm_h_node,
+            norm_displacement=norm_displacement,
+            norm_displacement_scale_init=norm_displacement_scale_init,
             dropout=dropout,
-            pos_weights_clamp_value=pos_weights_clamp_value,
+            x_weights_clamp_value=x_weights_clamp_value,
             tripp_num_layers=tripp_num_layers,
         )
 
     def forward(
         self,
+        h_node: Tensor,
         x: Tensor,
-        pos: Tensor,
         edge_index: Tensor,
-        edge_attr: Tensor | None = None,
+        h_edge: Tensor | None = None,
         box: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Message-passing update on a packed graph.
 
-        :param x: Node features (N, dim).
-        :param pos: Node positions (N, 3).
+        :param h_node: Node features (N, dim).
+        :param x: Node positions (N, 3).
         :param edge_index: Edge connectivity (2, E) as ``[source/neighbor, target/center]``.
-        :param edge_attr: Edge features (E, edge_dim), or None.
+        :param h_edge: Edge features (E, edge_dim), or None.
         :param box: Per-node box lengths (N, 3), or None.
         :return: Updated features (N, dim) and positions (N, 3)."""
 
         src, dst = edge_index[0], edge_index[1]
-        n = pos.shape[0]
+        n = x.shape[0]
 
-        rel_pos = minimum_image(
-            pos[dst] - pos[src], box[dst] if box is not None else None
-        )
-        dist = squared_distance(rel_pos).clamp(min=1e-8).sqrt()
+        rel_x = minimum_image(x[dst] - x[src], box[dst] if box is not None else None)
+        dist = squared_distance(rel_x).clamp(min=1e-8).sqrt()
 
-        m_ij = self.core.message(x[dst], x[src], dist, edge_attr)
+        m_ij = self.core.message(h_node[dst], h_node[src], dist, h_edge)
 
-        normed = self.core.normalize_rel(rel_pos)
+        normed = self.core.normalize_rel(rel_x)
         if self.core.tripp:
             abc = self.core.triple_abc(m_ij)  # (E, 3)
             v = torch.stack(
@@ -192,22 +190,22 @@ class SparseEGNNLayer(nn.Module):
                 dim=1,
             )  # (N, 3=k, 3=xyz)
             chi = signed_volume(v[:, 0], v[:, 1], v[:, 2])  # (N, 1)
-            weight = self.core.pos_weight(m_ij, chi[dst], chi[src])
+            weight = self.core.x_weight(m_ij, chi[dst], chi[src])
         else:
-            weight = self.core.pos_weight(m_ij)
+            weight = self.core.x_weight(m_ij)
 
-        pos_out = pos + scatter(weight * normed, dst, dim=0, dim_size=n, reduce="sum")
+        x_out = x + scatter(weight * normed, dst, dim=0, dim_size=n, reduce="sum")
 
         m_pooled = scatter(m_ij, dst, dim=0, dim_size=n, reduce=self.aggr)
-        x_out = self.core.update_x(x, m_pooled)
-        return x_out, pos_out
+        h_node_out = self.core.update_h_node(h_node, m_pooled)
+        return h_node_out, x_out
 
 
 class GeometricEGNN(nn.Module):
     """E(3)-equivariant GNN on packed torch-geometric tensors.
 
     Expects node features already projected to ``dim`` (embed upstream, as with the dense
-    backbone). The neighborhood is the union of static bonds (``edge_index`` / ``edge_attr``,
+    backbone). The neighborhood is the union of static bonds (``edge_index`` / ``h_edge``,
     given from outside) and internal distance-based edges (``distance_cutoff`` radius and/or
     ``num_nearest_neighbors`` kNN), with self-loops excluded; with none of these it is all-pairs
     within each graph. Dynamic graphs use ``torch_cluster`` for open boundaries and the dense
@@ -261,38 +259,36 @@ class GeometricEGNN(nn.Module):
 
     def forward(
         self,
+        h_node: Tensor,
         x: Tensor,
-        pos: Tensor,
         edge_index: Tensor | None = None,
-        edge_attr: Tensor | None = None,
+        h_edge: Tensor | None = None,
         batch: Tensor | None = None,
         box: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Run all message-passing layers on a packed graph.
 
-        :param x: Node features (N, dim).
-        :param pos: Node positions (N, 3).
+        :param h_node: Node features (N, dim).
+        :param x: Node positions (N, 3).
         :param edge_index: Static edge connectivity (2, E) as ``[source/neighbor, target/center]``,
             or None.
-        :param edge_attr: Static edge features (E, edge_dim), or None.
+        :param h_edge: Static edge features (E, edge_dim), or None.
         :param batch: Graph membership (N,), or None for a single graph.
         :param box: Per-node box lengths (N, 3), or None.
         :return: Updated features (N, dim) and positions (N, 3)."""
 
-        edge_index, edge_attr = self._build_graph(
-            pos, edge_index, edge_attr, batch, box
-        )
+        edge_index, h_edge = self._build_graph(x, edge_index, h_edge, batch, box)
 
         for layer in self.layers:
-            x, pos = layer(x, pos, edge_index, edge_attr, box=box)
+            h_node, x = layer(h_node, x, edge_index, h_edge, box=box)
 
-        return x, pos
+        return h_node, x
 
     def _build_graph(
         self,
-        pos: Tensor,
+        x: Tensor,
         edge_index: Tensor | None,
-        edge_attr: Tensor | None,
+        h_edge: Tensor | None,
         batch: Tensor | None,
         box: Tensor | None,
     ) -> tuple[Tensor, Tensor | None]:
@@ -302,22 +298,22 @@ class GeometricEGNN(nn.Module):
         static features survive). With no static edges and no distance graph the result is
         all-pairs within each graph.
 
-        :return: The combined ``(edge_index, edge_attr)``."""
+        :return: The combined ``(edge_index, h_edge)``."""
 
-        n = pos.shape[0]
+        n = x.shape[0]
         dynamic: list[Tensor] = []
         if self.distance_cutoff > 0:
-            dynamic.append(radius_edges(pos, self.distance_cutoff, batch, box))
+            dynamic.append(radius_edges(x, self.distance_cutoff, batch, box))
         if self.num_nearest_neighbors > 0:
-            dynamic.append(knn_edges(pos, self.num_nearest_neighbors, batch, box))
+            dynamic.append(knn_edges(x, self.num_nearest_neighbors, batch, box))
         if edge_index is None and not dynamic:
-            dynamic.append(radius_graph_pbc(pos, float("inf"), batch, box))
+            dynamic.append(radius_graph_pbc(x, float("inf"), batch, box))
 
         indices = ([edge_index] if edge_index is not None else []) + dynamic
 
         if self.edge_dim > 0:
-            attrs = [edge_attr] if edge_index is not None else []
-            attrs += [pos.new_zeros(extra.shape[1], self.edge_dim) for extra in dynamic]
+            attrs = [h_edge] if edge_index is not None else []
+            attrs += [x.new_zeros(extra.shape[1], self.edge_dim) for extra in dynamic]
             return coalesce(
                 torch.cat(indices, dim=1),
                 torch.cat(attrs, dim=0),

@@ -2,7 +2,7 @@ import torch
 from torch import Tensor, nn
 
 from .encodings import Encoding, encode_distance, encoding_width
-from .nn import MLP, PosNorm
+from .nn import MLP, DisplacementNorm
 
 
 def _init_mlp(mlp: nn.Module, gain: float = 1e-3) -> None:
@@ -14,9 +14,7 @@ def _init_mlp(mlp: nn.Module, gain: float = 1e-3) -> None:
                 nn.init.zeros_(m.bias)
 
 
-def _init_pos_head(
-    mlp: nn.Module, gain: float = 1e-3, final_scale: float = 0.01
-) -> None:
+def _init_x_head(mlp: nn.Module, gain: float = 1e-3, final_scale: float = 0.01) -> None:
     """Xavier-init the position head and shrink its last layer for near-identity updates."""
     linears = [m for m in mlp.modules() if isinstance(m, nn.Linear)]
     for i, m in enumerate(linears):
@@ -40,11 +38,11 @@ class EquivariantUpdate(nn.Module):
         m_dim: int = 16,
         edge_dim: int = 0,
         soft_edges: bool = False,
-        norm_x: bool = False,
-        norm_pos: bool = False,
-        norm_pos_scale_init: float = 1.0,
+        norm_h_node: bool = False,
+        norm_displacement: bool = False,
+        norm_displacement_scale_init: float = 1.0,
         dropout: float = 0.0,
-        pos_weights_clamp_value: float | None = None,
+        x_weights_clamp_value: float | None = None,
         tripp_num_layers: int = 0,
     ) -> None:
         """Build the update.
@@ -56,11 +54,11 @@ class EquivariantUpdate(nn.Module):
         :param m_dim: Hidden message dimensionality.
         :param edge_dim: Extra per-edge feature dimensionality (0 if none).
         :param soft_edges: Gate messages by a learned scalar in [0, 1].
-        :param norm_x: LayerNorm node features before the node update.
-        :param norm_pos: Normalize displacement vectors in the position update.
-        :param norm_pos_scale_init: Initial scale of :class:`PosNorm`.
+        :param norm_h_node: LayerNorm node features before the node update.
+        :param norm_displacement: Normalize displacement vectors in the position update.
+        :param norm_displacement_scale_init: Initial scale of :class:`DisplacementNorm`.
         :param dropout: Dropout probability inside the MLPs.
-        :param pos_weights_clamp_value: Optional symmetric clamp on position weights.
+        :param x_weights_clamp_value: Optional symmetric clamp on position weights.
         :param tripp_num_layers: Depth of the triple-product MLP; > 0 turns on the SE(3)
             chirality term (0 keeps the update E(3)-equivariant)."""
 
@@ -68,7 +66,7 @@ class EquivariantUpdate(nn.Module):
         self.encoding = encoding
         self.encoding_features = encoding_features
         self.cutoff = cutoff
-        self.pos_weights_clamp_value = pos_weights_clamp_value
+        self.x_weights_clamp_value = x_weights_clamp_value
         self.tripp = tripp_num_layers > 0
 
         dist_width = encoding_width(encoding, encoding_features)
@@ -85,16 +83,18 @@ class EquivariantUpdate(nn.Module):
             nn.Sequential(nn.Linear(m_dim, 1), nn.Sigmoid()) if soft_edges else None
         )
 
-        self.node_norm = nn.LayerNorm(dim) if norm_x else nn.Identity()
+        self.node_norm = nn.LayerNorm(dim) if norm_h_node else nn.Identity()
         self.node_mlp = MLP(dim + m_dim, dim * 2, dim, dropout=dropout)
 
         # With the triple-product term the position head also sees the chirality scalar of
         # both endpoints, so its input widens by 2.
-        self.pos_mlp = MLP(
+        self.x_mlp = MLP(
             m_dim + (2 if self.tripp else 0), m_dim * 4, 1, dropout=dropout
         )
-        self.pos_norm = (
-            PosNorm(scale_init=norm_pos_scale_init) if norm_pos else nn.Identity()
+        self.displacement_norm = (
+            DisplacementNorm(scale_init=norm_displacement_scale_init)
+            if norm_displacement
+            else nn.Identity()
         )
         self.triple_mlp = (
             MLP(m_dim, m_dim, 3, num_layers=tripp_num_layers, dropout=dropout)
@@ -104,41 +104,41 @@ class EquivariantUpdate(nn.Module):
 
         _init_mlp(self.edge_mlp)
         _init_mlp(self.node_mlp)
-        _init_pos_head(self.pos_mlp)
+        _init_x_head(self.x_mlp)
         if self.triple_mlp is not None:
             _init_mlp(self.triple_mlp)
 
     def message(
         self,
-        x_i: Tensor,
-        x_j: Tensor,
+        h_node_i: Tensor,
+        h_node_j: Tensor,
         dist: Tensor,
-        edge_attr: Tensor | None = None,
+        h_edge: Tensor | None = None,
     ) -> Tensor:
         """Per-pair messages.
 
-        :param x_i: Target-node features (P, dim).
-        :param x_j: Source-node features (P, dim).
+        :param h_node_i: Target-node features (P, dim).
+        :param h_node_j: Source-node features (P, dim).
         :param dist: True L2 distances (P, 1).
-        :param edge_attr: Optional per-pair edge features (P, edge_dim).
+        :param h_edge: Optional per-pair edge features (P, edge_dim).
         :return: Messages (P, m_dim)."""
 
         enc = encode_distance(dist, self.encoding, self.encoding_features, self.cutoff)
-        parts = [x_i, x_j, enc]
-        if edge_attr is not None:
-            parts.append(edge_attr)
+        parts = [h_node_i, h_node_j, enc]
+        if h_edge is not None:
+            parts.append(h_edge)
         m_ij = self.edge_mlp(torch.cat(parts, dim=-1))
         if self.edge_gate is not None:
             m_ij = m_ij * self.edge_gate(m_ij)
         return m_ij
 
-    def normalize_rel(self, rel_pos: Tensor) -> Tensor:
-        """Direction-normalize relative positions (identity if ``norm_pos`` is off).
+    def normalize_rel(self, rel_x: Tensor) -> Tensor:
+        """Direction-normalize relative positions (identity if ``norm_displacement`` is off).
 
-        :param rel_pos: Relative positions (P, 3), already minimum-image wrapped.
+        :param rel_x: Relative positions (P, 3), already minimum-image wrapped.
         :return: Normalized relative positions (P, 3)."""
 
-        return self.pos_norm(rel_pos)
+        return self.displacement_norm(rel_x)
 
     def triple_abc(self, m_ij: Tensor) -> Tensor:
         """Per-pair scalar weights for the three chirality vector fields (SE(3) term only).
@@ -148,7 +148,7 @@ class EquivariantUpdate(nn.Module):
 
         return self.triple_mlp(m_ij)
 
-    def pos_weight(
+    def x_weight(
         self, m_ij: Tensor, chi_i: Tensor | None = None, chi_j: Tensor | None = None
     ) -> Tensor:
         """Per-pair scalar position weight.
@@ -162,18 +162,18 @@ class EquivariantUpdate(nn.Module):
         :return: Position weights (P, 1)."""
 
         inp = torch.cat([m_ij, chi_i, chi_j], dim=-1) if self.tripp else m_ij
-        weight = self.pos_mlp(inp)
-        if self.pos_weights_clamp_value is not None:
-            c = self.pos_weights_clamp_value
+        weight = self.x_mlp(inp)
+        if self.x_weights_clamp_value is not None:
+            c = self.x_weights_clamp_value
             weight = weight.clamp(min=-c, max=c)
         return weight
 
-    def update_x(self, x: Tensor, m_pooled: Tensor) -> Tensor:
+    def update_h_node(self, h_node: Tensor, m_pooled: Tensor) -> Tensor:
         """Residual node-feature update from already-reduced messages.
 
-        :param x: Node features (num_nodes, dim).
+        :param h_node: Node features (num_nodes, dim).
         :param m_pooled: Reduced messages per node (num_nodes, m_dim).
         :return: Updated node features (num_nodes, dim)."""
 
-        normed = self.node_norm(x)
-        return self.node_mlp(torch.cat([normed, m_pooled], dim=-1)) + x
+        normed = self.node_norm(h_node)
+        return self.node_mlp(torch.cat([normed, m_pooled], dim=-1)) + h_node

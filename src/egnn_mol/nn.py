@@ -47,7 +47,7 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-class PosNorm(nn.Module):
+class DisplacementNorm(nn.Module):
     """Normalize displacement vectors to unit length, then rescale by a learnable factor.
 
     Normalizing keeps position-update magnitudes independent of the box / bond lengths,
@@ -60,7 +60,7 @@ class PosNorm(nn.Module):
         self.eps = eps
         self.scale = nn.Parameter(torch.zeros(1).fill_(scale_init))
 
-    def forward(self, pos: Tensor) -> Tensor:
-        """:param pos: Displacement vectors (..., 3). :return: Rescaled unit vectors (..., 3)."""
-        norm = pos.norm(dim=-1, keepdim=True)
-        return pos / norm.clamp(min=self.eps) * self.scale
+    def forward(self, x: Tensor) -> Tensor:
+        """:param x: Displacement vectors (..., 3). :return: Rescaled unit vectors (..., 3)."""
+        norm = x.norm(dim=-1, keepdim=True)
+        return x / norm.clamp(min=self.eps) * self.scale

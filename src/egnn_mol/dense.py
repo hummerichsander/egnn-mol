@@ -46,7 +46,7 @@ def _box_for_pairs(box: Tensor | None) -> Tensor | None:
 
 
 def build_neighborhood(
-    pos: Tensor,
+    x: Tensor,
     box: Tensor | None,
     adj_mat: Tensor | None,
     mask: Tensor | None,
@@ -59,7 +59,7 @@ def build_neighborhood(
     and a kNN graph (``num_nearest_neighbors``), all under the minimum-image convention and with
     self-loops removed. It is derived once from the input positions and shared across layers.
 
-    :param pos: Node positions (B, N, 3).
+    :param x: Node positions (B, N, 3).
     :param box: Periodic box lengths (B, 3), or None.
     :param adj_mat: Static boolean adjacency (B, N, N) or (N, N), or None.
     :param mask: Node validity mask (B, N), or None.
@@ -67,12 +67,12 @@ def build_neighborhood(
     :param num_nearest_neighbors: kNN degree for dynamic edges (0 disables).
     :return: Neighbor indices (B, N, K) and a boolean edge-validity mask (B, N, K)."""
 
-    b, n, _ = pos.shape
-    device = pos.device
+    b, n, _ = x.shape
+    device = x.device
     eye = torch.eye(n, dtype=torch.bool, device=device)[None]
 
     with torch.no_grad():
-        rel = rearrange(pos, "b i d -> b i () d") - rearrange(pos, "b j d -> b () j d")
+        rel = rearrange(x, "b i d -> b i () d") - rearrange(x, "b j d -> b () j d")
         dist_sq = (minimum_image(rel, _box_for_pairs(box)) ** 2).sum(dim=-1)
 
         pair_valid = torch.ones(b, n, n, dtype=torch.bool, device=device)
@@ -124,11 +124,11 @@ class DenseEGNNLayer(nn.Module):
         edge_dim: int = 0,
         aggr: Aggregation = "sum",
         dropout: float = 0.0,
-        norm_x: bool = False,
-        norm_pos: bool = False,
-        norm_pos_scale_init: float = 1.0,
+        norm_h_node: bool = False,
+        norm_displacement: bool = False,
+        norm_displacement_scale_init: float = 1.0,
         soft_edges: bool = False,
-        pos_weights_clamp_value: float | None = None,
+        x_weights_clamp_value: float | None = None,
         tripp_num_layers: int = 0,
     ) -> None:
         """See :class:`EGNN` for the meaning of the arguments."""
@@ -144,19 +144,19 @@ class DenseEGNNLayer(nn.Module):
             m_dim=m_dim,
             edge_dim=edge_dim,
             soft_edges=soft_edges,
-            norm_x=norm_x,
-            norm_pos=norm_pos,
-            norm_pos_scale_init=norm_pos_scale_init,
+            norm_h_node=norm_h_node,
+            norm_displacement=norm_displacement,
+            norm_displacement_scale_init=norm_displacement_scale_init,
             dropout=dropout,
-            pos_weights_clamp_value=pos_weights_clamp_value,
+            x_weights_clamp_value=x_weights_clamp_value,
             tripp_num_layers=tripp_num_layers,
         )
 
     def forward(
         self,
+        h_node: Tensor,
         x: Tensor,
-        pos: Tensor,
-        edge_attr: Tensor | None = None,
+        h_edge: Tensor | None = None,
         mask: Tensor | None = None,
         box: Tensor | None = None,
         nbhd_indices: Tensor | None = None,
@@ -164,9 +164,9 @@ class DenseEGNNLayer(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         """Message-passing update over a neighborhood (or all-pairs, self-excluded, if none given).
 
-        :param x: Node features (B, N, dim).
-        :param pos: Node positions (B, N, 3).
-        :param edge_attr: Edge features — dense (B, N, N, edge_dim) or, with ``nbhd_indices``,
+        :param h_node: Node features (B, N, dim).
+        :param x: Node positions (B, N, 3).
+        :param h_edge: Edge features — dense (B, N, N, edge_dim) or, with ``nbhd_indices``,
             (B, N, K, edge_dim).
         :param mask: Node validity mask (B, N), or None.
         :param box: Periodic box lengths (B, 3), or None.
@@ -175,30 +175,28 @@ class DenseEGNNLayer(nn.Module):
         :return: Updated features (B, N, dim) and positions (B, N, 3)."""
 
         box_pairs = _box_for_pairs(box)
-        b, n, _ = x.shape
+        b, n, _ = h_node.shape
 
         if nbhd_indices is not None:
-            pos_j = batched_index_select(pos, nbhd_indices, dim=1)
-            rel_pos = minimum_image(
-                rearrange(pos, "b i d -> b i () d") - pos_j, box_pairs
-            )
             x_j = batched_index_select(x, nbhd_indices, dim=1)
+            rel_x = minimum_image(rearrange(x, "b i d -> b i () d") - x_j, box_pairs)
+            h_node_j = batched_index_select(h_node, nbhd_indices, dim=1)
         else:
-            rel_pos = rearrange(pos, "b i d -> b i () d") - rearrange(
-                pos, "b j d -> b () j d"
+            rel_x = rearrange(x, "b i d -> b i () d") - rearrange(
+                x, "b j d -> b () j d"
             )
-            rel_pos = minimum_image(rel_pos, box_pairs)
-            x_j = rearrange(x, "b j d -> b () j d")
+            rel_x = minimum_image(rel_x, box_pairs)
+            h_node_j = rearrange(h_node, "b j d -> b () j d")
 
-        dist = squared_distance(rel_pos).clamp(min=1e-8).sqrt()
-        x_i = rearrange(x, "b i d -> b i () d")
-        x_i, x_j = torch.broadcast_tensors(x_i, x_j)
+        dist = squared_distance(rel_x).clamp(min=1e-8).sqrt()
+        h_node_i = rearrange(h_node, "b i d -> b i () d")
+        h_node_i, h_node_j = torch.broadcast_tensors(h_node_i, h_node_j)
 
-        m_ij = self.core.message(x_i, x_j, dist, edge_attr)
+        m_ij = self.core.message(h_node_i, h_node_j, dist, h_edge)
 
-        edge_mask = self._edge_mask(mask, nbhd_indices, nbhd_mask, b, n, x.device)
+        edge_mask = self._edge_mask(mask, nbhd_indices, nbhd_mask, b, n, h_node.device)
 
-        normed = self.core.normalize_rel(rel_pos)
+        normed = self.core.normalize_rel(rel_x)
 
         if self.core.tripp:
             abc = self.core.triple_abc(m_ij)  # (B, N, K, 3)
@@ -215,14 +213,14 @@ class DenseEGNNLayer(nn.Module):
             else:
                 chi_j = rearrange(chi, "b j one -> b () j one")
             chi_i, chi_j = torch.broadcast_tensors(chi_i, chi_j)
-            weight = self.core.pos_weight(m_ij, chi_i, chi_j)
+            weight = self.core.x_weight(m_ij, chi_i, chi_j)
         else:
-            weight = self.core.pos_weight(m_ij)
+            weight = self.core.x_weight(m_ij)
 
         delta = weight * normed
         if edge_mask is not None:
             delta = delta.masked_fill(~rearrange(edge_mask, "... -> ... ()"), 0.0)
-        pos_out = pos + delta.sum(dim=2)
+        x_out = x + delta.sum(dim=2)
 
         if edge_mask is not None:
             m_ij = m_ij.masked_fill(~rearrange(edge_mask, "... -> ... ()"), 0.0)
@@ -235,8 +233,8 @@ class DenseEGNNLayer(nn.Module):
         else:
             m_pooled = m_ij.sum(dim=2)
 
-        x_out = self.core.update_x(x, m_pooled)
-        return x_out, pos_out
+        h_node_out = self.core.update_h_node(h_node, m_pooled)
+        return h_node_out, x_out
 
     def _edge_mask(
         self,
@@ -272,7 +270,7 @@ class EGNN(nn.Module):
     """E(3)-equivariant graph neural network on dense padded tensors.
 
     Handles periodic boxes (pass ``box``) and open boundaries. The neighborhood is the union of
-    static bonds (``adj_mat`` / ``edge_attr``, given from outside) and internal distance-based
+    static bonds (``adj_mat`` / ``h_edge``, given from outside) and internal distance-based
     edges (``distance_cutoff`` radius and/or ``num_nearest_neighbors`` kNN), with self-loops
     excluded; with none of these it is all-pairs. It is built once and shared across layers."""
 
@@ -324,24 +322,24 @@ class EGNN(nn.Module):
 
     def forward(
         self,
+        h_node: Tensor,
         x: Tensor,
-        pos: Tensor,
         adj_mat: Tensor | None = None,
-        edge_attr: Tensor | None = None,
+        h_edge: Tensor | None = None,
         mask: Tensor | None = None,
         box: Tensor | None = None,
-        return_pos_changes: bool = False,
+        return_x_changes: bool = False,
     ):
         """Run all message-passing layers.
 
-        :param x: Node features (B, N, dim).
-        :param pos: Node positions (B, N, 3).
+        :param h_node: Node features (B, N, dim).
+        :param x: Node positions (B, N, 3).
         :param adj_mat: Static boolean adjacency (B, N, N) or (N, N), or None.
-        :param edge_attr: Static edge features (B, N, N, edge_dim), or None.
+        :param h_edge: Static edge features (B, N, N, edge_dim), or None.
         :param mask: Node validity mask (B, N), or None.
         :param box: Periodic box lengths (B, 3), or None.
-        :param return_pos_changes: If True, also return the position trajectory.
-        :return: ``(x, pos)`` or ``(x, pos, pos_changes)``."""
+        :param return_x_changes: If True, also return the position trajectory.
+        :return: ``(h_node, x)`` or ``(h_node, x, x_changes)``."""
 
         nbhd_indices: Tensor | None = None
         nbhd_mask: Tensor | None = None
@@ -351,29 +349,29 @@ class EGNN(nn.Module):
             or self.num_nearest_neighbors > 0
         ):
             nbhd_indices, nbhd_mask = build_neighborhood(
-                pos,
+                x,
                 box,
                 adj_mat,
                 mask,
                 self.distance_cutoff,
                 self.num_nearest_neighbors,
             )
-            if edge_attr is not None:
-                edge_attr = batched_index_select(edge_attr, nbhd_indices, dim=2)
+            if h_edge is not None:
+                h_edge = batched_index_select(h_edge, nbhd_indices, dim=2)
 
-        pos_changes = [pos]
+        x_changes = [x]
         for layer in self.layers:
-            x, pos = layer(
+            h_node, x = layer(
+                h_node,
                 x,
-                pos,
-                edge_attr=edge_attr,
+                h_edge=h_edge,
                 mask=mask,
                 box=box,
                 nbhd_indices=nbhd_indices,
                 nbhd_mask=nbhd_mask,
             )
-            pos_changes.append(pos)
+            x_changes.append(x)
 
-        if return_pos_changes:
-            return x, pos, pos_changes
-        return x, pos
+        if return_x_changes:
+            return h_node, x, x_changes
+        return h_node, x

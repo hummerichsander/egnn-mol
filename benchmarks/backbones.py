@@ -32,9 +32,9 @@ DIM, DEPTH, M_DIM, CUTOFF, DENSITY = (
 def _random_system(n: int, device: torch.device):
     """A cubic open-boundary system of ``n`` atoms at fixed number density."""
     side = (n / DENSITY) ** (1 / 3)
-    pos = torch.rand(n, 3, device=device) * side
-    x = torch.randn(n, DIM, device=device)
-    return x, pos
+    x = torch.rand(n, 3, device=device) * side
+    h_node = torch.randn(n, DIM, device=device)
+    return h_node, x
 
 
 def _time_forward(fn, device: torch.device, iters: int = 20) -> float:
@@ -147,15 +147,15 @@ def main() -> None:
     rows = []
     torch.manual_seed(0)
     for n in SIZES:
-        x, pos = _random_system(n, device)
+        h_node, x = _random_system(n, device)
 
         def run_dense():
             with torch.no_grad():
-                return dense(x[None], pos[None])
+                return dense(h_node[None], x[None])
 
         def run_sparse():
             with torch.no_grad():
-                return sparse(x, pos)
+                return sparse(h_node, x)
 
         for _ in range(2):  # warmup lazy allocations before profiling
             run_dense()

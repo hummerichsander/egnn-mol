@@ -10,7 +10,7 @@ from .encodings import (
     polynomial_envelope,
 )
 from .geometry import minimum_image, signed_volume, squared_distance
-from .nn import MLP, PosNorm
+from .nn import MLP, DisplacementNorm
 from .sparse import (
     GeometricEGNN,
     SparseEGNNLayer,
@@ -31,7 +31,7 @@ __all__ = [
     "knn_edges",
     "EquivariantUpdate",
     "MLP",
-    "PosNorm",
+    "DisplacementNorm",
     "minimum_image",
     "squared_distance",
     "signed_volume",
