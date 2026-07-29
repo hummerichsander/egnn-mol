@@ -1,8 +1,8 @@
 from typing import Literal
 
 import torch
-from torch import Tensor, nn
 from einops import rearrange, repeat
+from torch import Tensor, nn
 
 from .encodings import Encoding
 from .geometry import minimum_image, signed_volume, squared_distance

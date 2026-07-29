@@ -149,11 +149,11 @@ def main() -> None:
     for n in SIZES:
         h_node, x = _random_system(n, device)
 
-        def run_dense():
+        def run_dense(h_node=h_node, x=x):
             with torch.no_grad():
                 return dense(h_node[None], x[None])
 
-        def run_sparse():
+        def run_sparse(h_node=h_node, x=x):
             with torch.no_grad():
                 return sparse(h_node, x)
 

@@ -49,11 +49,11 @@ import torch
 from egnn_mol import EGNN
 
 net = EGNN(depth=4, dim=64, encoding="bessel", encoding_features=8, cutoff=1.0)
-h_node = torch.randn(2, 10, 64)                          # node features (B, N, dim)
-x = torch.randn(2, 10, 3)                                # positions (B, N, 3)
-box = torch.tensor([[2.0, 2.0, 2.0], [2.5, 2.0, 1.8]])   # periodic box lengths, or omit
+h_node = torch.randn(2, 10, 64)  # node features (B, N, dim)
+x = torch.randn(2, 10, 3)  # positions (B, N, 3)
+box = torch.tensor([[2.0, 2.0, 2.0], [2.5, 2.0, 1.8]])  # periodic box lengths, or omit
 h_node_out, x_out = net(h_node, x, box=box)
-velocity = x_out - x                                     # displacement is the equivariant output
+velocity = x_out - x  # displacement is the equivariant output
 ```
 
 The sparse backbone works on packed tensors:
@@ -62,9 +62,11 @@ The sparse backbone works on packed tensors:
 from egnn_mol import GeometricEGNN
 
 net = GeometricEGNN(depth=4, dim=64, distance_cutoff=1.0)
-h_node = torch.randn(100, 64)     # node features (ΣN, dim)
-x = torch.randn(100, 3)           # positions (ΣN, 3)
-h_node_out, x_out = net(h_node, x, batch=batch)   # edge_index optional; radius graph built internally
+h_node = torch.randn(100, 64)  # node features (ΣN, dim)
+x = torch.randn(100, 3)  # positions (ΣN, 3)
+h_node_out, x_out = net(
+    h_node, x, batch=batch
+)  # edge_index optional; radius graph built internally
 ```
 
 ## Forward API
