@@ -111,6 +111,58 @@ def knn_edges(x: Tensor, k: int, batch: Tensor | None, box: Tensor | None) -> Te
     return knn_graph(x, k=k, batch=batch, loop=False, flow="source_to_target")
 
 
+def build_edges(
+    x: Tensor,
+    edge_index: Tensor | None,
+    h_edge: Tensor | None,
+    batch: Tensor | None,
+    box: Tensor | None,
+    *,
+    edge_dim: int = 0,
+    distance_cutoff: float = 0.0,
+    num_nearest_neighbors: int = 0,
+) -> tuple[Tensor, Tensor | None]:
+    """Union static bonds with internal distance-based (radius / kNN) edges.
+
+    Dynamic edges get zero edge features; duplicates are coalesced (summing attributes, so
+    static features survive). With no static edges and no distance graph the result is
+    all-pairs within each graph. Shared by every packed backbone, so they provably see the
+    same edge set for the same arguments.
+
+    :param x: Node positions (N, 3).
+    :param edge_index: Static edge connectivity (2, E) as ``[source/neighbor, target/center]``,
+        or None.
+    :param h_edge: Static edge features (E, edge_dim), or None.
+    :param batch: Graph membership (N,), or None for a single graph.
+    :param box: Per-node box lengths (N, 3), or None.
+    :param edge_dim: Edge-feature width; 0 returns no edge features.
+    :param distance_cutoff: If > 0, add a radius graph of dynamic edges.
+    :param num_nearest_neighbors: If > 0, add a kNN graph of dynamic edges.
+    :return: The combined ``(edge_index, h_edge)``."""
+
+    n = x.shape[0]
+    dynamic: list[Tensor] = []
+    if distance_cutoff > 0:
+        dynamic.append(radius_edges(x, distance_cutoff, batch, box))
+    if num_nearest_neighbors > 0:
+        dynamic.append(knn_edges(x, num_nearest_neighbors, batch, box))
+    if edge_index is None and not dynamic:
+        dynamic.append(radius_graph_pbc(x, float("inf"), batch, box))
+
+    indices = ([edge_index] if edge_index is not None else []) + dynamic
+
+    if edge_dim > 0:
+        attrs = [h_edge] if edge_index is not None else []
+        attrs += [x.new_zeros(extra.shape[1], edge_dim) for extra in dynamic]
+        return coalesce(
+            torch.cat(indices, dim=1),
+            torch.cat(attrs, dim=0),
+            num_nodes=n,
+            reduce="sum",
+        )
+    return coalesce(torch.cat(indices, dim=1), num_nodes=n), None
+
+
 class SparseEGNNLayer(nn.Module):
     """One packed-graph message-passing layer wrapping the shared :class:`EquivariantUpdate`."""
 
@@ -277,47 +329,18 @@ class GeometricEGNN(nn.Module):
         :param box: Per-node box lengths (N, 3), or None.
         :return: Updated features (N, dim) and positions (N, 3)."""
 
-        edge_index, h_edge = self._build_graph(x, edge_index, h_edge, batch, box)
+        edge_index, h_edge = build_edges(
+            x,
+            edge_index,
+            h_edge,
+            batch,
+            box,
+            edge_dim=self.edge_dim,
+            distance_cutoff=self.distance_cutoff,
+            num_nearest_neighbors=self.num_nearest_neighbors,
+        )
 
         for layer in self.layers:
             h_node, x = layer(h_node, x, edge_index, h_edge, box=box)
 
         return h_node, x
-
-    def _build_graph(
-        self,
-        x: Tensor,
-        edge_index: Tensor | None,
-        h_edge: Tensor | None,
-        batch: Tensor | None,
-        box: Tensor | None,
-    ) -> tuple[Tensor, Tensor | None]:
-        """Union static bonds with internal distance-based (radius / kNN) edges.
-
-        Dynamic edges get zero edge features; duplicates are coalesced (summing attributes, so
-        static features survive). With no static edges and no distance graph the result is
-        all-pairs within each graph.
-
-        :return: The combined ``(edge_index, h_edge)``."""
-
-        n = x.shape[0]
-        dynamic: list[Tensor] = []
-        if self.distance_cutoff > 0:
-            dynamic.append(radius_edges(x, self.distance_cutoff, batch, box))
-        if self.num_nearest_neighbors > 0:
-            dynamic.append(knn_edges(x, self.num_nearest_neighbors, batch, box))
-        if edge_index is None and not dynamic:
-            dynamic.append(radius_graph_pbc(x, float("inf"), batch, box))
-
-        indices = ([edge_index] if edge_index is not None else []) + dynamic
-
-        if self.edge_dim > 0:
-            attrs = [h_edge] if edge_index is not None else []
-            attrs += [x.new_zeros(extra.shape[1], self.edge_dim) for extra in dynamic]
-            return coalesce(
-                torch.cat(indices, dim=1),
-                torch.cat(attrs, dim=0),
-                num_nodes=n,
-                reduce="sum",
-            )
-        return coalesce(torch.cat(indices, dim=1), num_nodes=n), None

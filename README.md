@@ -13,6 +13,15 @@ Both share the same minimum-image periodicity handling, distance encodings, equi
 update, and near-identity initialization — the two backbones compute the *same* function from the
 same weights (verified by test).
 
+Alongside them:
+
+- **`RadialField`** — a sparse velocity field with an **analytic divergence**, after Köhler, Klein
+  & Noé ([arXiv:2006.02425](https://arxiv.org/abs/2006.02425)). It returns `(v, div v)` instead of
+  `(h_node, x)`, trading the EGNN's message passing for a closed-form Jacobian trace — which is
+  what a continuous normalizing flow needs to compute an exact log-likelihood without `O(3N)`
+  backward passes or a stochastic trace estimator. It shares the encodings, the periodicity
+  handling and the neighborhood builder with `GeometricEGNN`.
+
 ## Install
 
 Not on PyPI yet — install from GitHub:
@@ -69,11 +78,30 @@ h_node_out, x_out = net(
 )  # edge_index optional; radius graph built internally
 ```
 
+`RadialField` is a velocity field rather than a layer stack, so it takes a per-node time and
+returns the velocity together with its exact divergence — one scalar per graph:
+
+```python
+from egnn_mol import RadialField
+
+net = RadialField(
+    dim=64, encoding="bessel", encoding_features=32, cutoff=1.0, distance_cutoff=1.0
+)
+h_node = torch.randn(100, 64)  # node features (ΣN, dim)
+x = torch.randn(100, 3)  # positions (ΣN, 3)
+t = torch.full((100, 1), 0.5)  # per-node time, as box is per-node
+v, div = net(h_node, x, t, batch=batch)  # v: (ΣN, 3), div: (num_graphs,)
+```
+
+`div` equals the autograd trace of `dv/dx` to machine precision (`tests/test_radial.py`), so it
+drops straight into `d/dt log p = -div v` with no Hutchinson estimator.
+
 ## Forward API
 
-The `forward` methods are the primary API. Both return `(h_node, x)`; only `h_node` and `x` are
-required. Static edges (bonds) are optional inputs; the distance-based (dynamic) graph is
-configured at construction (`distance_cutoff` / `num_nearest_neighbors`).
+The `forward` methods are the primary API. The two EGNNs return `(h_node, x)` and need only
+`h_node` and `x`; `RadialField` returns `(v, div v)` and additionally needs `t`. Static edges
+(bonds) are optional inputs; the distance-based (dynamic) graph is configured at construction
+(`distance_cutoff` / `num_nearest_neighbors`).
 
 **`EGNN.forward`** — dense padded tensors:
 
@@ -98,12 +126,25 @@ configured at construction (`distance_cutoff` / `num_nearest_neighbors`).
 | `batch` | `(ΣN,)`, or `None` | Graph membership for a ragged batch. |
 | `box` | `(ΣN, 3)`, or `None` | Per-node periodic box lengths (`None` = open). |
 
+**`RadialField.forward`** — packed graph tensors plus a time, returning `(v, div v)`:
+
+| Argument | Shape | Description |
+|---|---|---|
+| `h_node` | `(ΣN, dim)` | Node features. |
+| `x` | `(ΣN, 3)` | Node positions. |
+| `t` | `(ΣN, 1)` or `(ΣN,)` | Per-node time, fed to the coefficient head. |
+| `edge_index` | `(2, E)`, or `None` | Static bonds, `[source/neighbor, target/center]`. |
+| `h_edge` | `(E, edge_dim)`, or `None` | Static edge features. |
+| `batch` | `(ΣN,)`, or `None` | Graph membership for a ragged batch. |
+| `box` | `(ΣN, 3)`, or `None` | Per-node periodic box lengths (`None` = open). |
+
 ## Hyperparameters
 
-All constructor arguments are keyword-only and **identical across both backbones**. `depth` and
-`dim` are required; everything else has a default. Extra arguments are forwarded to the layers.
+All constructor arguments are keyword-only and **identical across both EGNN backbones**. `depth`
+and `dim` are required; everything else has a default. Extra arguments are forwarded to the layers.
+`RadialField` shares the encoding and neighborhood arguments and has its own model section below.
 
-### Model
+### Model — `EGNN` / `GeometricEGNN`
 
 | Name | Default | Description |
 |---|---|---|
@@ -119,6 +160,37 @@ All constructor arguments are keyword-only and **identical across both backbones
 | `norm_displacement_scale_init` | `1.0` | Initial scale of the `DisplacementNorm` (only used when `norm_displacement=True`). |
 | `x_weights_clamp_value` | `None` | Optional symmetric clamp `[-c, c]` on the per-edge position weights. |
 | `tripp_num_layers` | `0` | Depth of the triple-product MLP. `> 0` enables the SE(3) chirality term (see below); `0` keeps the update E(3)-equivariant. |
+
+### `RadialField`
+
+`v_i = Σ_j φ(d_ij, t) r_ij` with `r_ij = x_i - x_j`, whose divergence is
+`Σ_ij [∂φ/∂d_ij · d_ij + D · φ]`. `φ` is **linear in the radial basis** — the coefficient head
+predicts the basis weights, never `φ` itself — which is what keeps `∂φ/∂d` an exact closed form
+rather than another autograd pass. Since the derivation only touches the diagonal Jacobian blocks
+`∂v_i/∂x_i`, `φ` may be conditioned on anything that does not read positions: node features, edge
+features and time all enter freely.
+
+| Name | Default | Description |
+|---|---|---|
+| `dim` | — | Node feature width. Features must already be this wide (embed upstream). |
+| `encoding_features` | `16` | Basis width. With no `depth` to stack, this is the primary capacity knob. |
+| `time_features` | `10` | Gaussian RBF centers spanning `t` in `[0, 1]`. |
+| `m_dim` | `64` | Hidden width of the coefficient head. |
+| `head_depth` | `2` | Hidden blocks in the coefficient head. It never reads positions, so it may be arbitrarily deep without touching the closed form. |
+| `envelope_exponent` | `6` | Exponent of the polynomial envelope applied when `distance_cutoff > 0`. |
+
+`encoding`, `cutoff`, `edge_dim`, `distance_cutoff` and `num_nearest_neighbors` mean exactly what
+they do for the two EGNNs. Two arguments are **absent by construction**:
+
+- **`depth`** — stacking these updates would make the total Jacobian a *product*, whose
+  log-determinant is not a sum of traces. The single pairwise sum is the whole receptive field, so
+  `distance_cutoff` matters far more here than for a deep EGNN.
+- **`aggr`** — the divergence formula above is written for a sum.
+
+With `distance_cutoff > 0` the polynomial envelope is applied automatically at that radius, so `φ`
+*and* `∂φ/∂d` vanish where edges enter and leave the graph. Without it the field would be
+discontinuous at the cutoff and the divergence would only hold away from the boundary. A static
+edge set needs no envelope: it does not depend on positions, so the field is smooth everywhere.
 
 ### Neighborhood — static edges ∪ dynamic edges
 
@@ -166,6 +238,13 @@ To let the network distinguish bonds from distance edges, reserve one channel of
 Encodings are plain functions selected by name — adding one is a single function plus a `match`
 arm in `egnn_mol/encodings.py` (no registry, base class, or factory). `polynomial_envelope` and
 `cosine_envelope` provide smooth cutoff weights for bases without an implicit cutoff.
+
+Every basis also ships its analytic derivative — `encode_distance_derivative`, plus
+`bessel_derivative` / `fourier_derivative` / `gaussian_derivative` and
+`polynomial_envelope_derivative` — which is what `RadialField` differentiates instead of calling
+autograd. A new encoding therefore needs both arms to be usable there. Note the bessel derivative
+carries a Taylor branch below `z = freq·d ≈ 0.1`: `z cos z - sin z` is a difference of two `O(z)`
+terms whose result is `O(z³/3)`, so the direct form keeps nothing of it in float32.
 
 ## E(3) vs SE(3)
 
@@ -221,3 +300,9 @@ scatter); `benchmarks/message_passing.py` confirms **identical outputs** and par
   periodic images, run `torch_cluster` against them, map image-edges back to base atoms with the
   MIC displacement) would give an `O(N)` periodic radius graph for large boxes (bilayers, solvated
   systems).
+- **Dense `RadialField`.** The closed form is layout-agnostic (a per-edge scalar summed per
+  graph), but only the sparse form exists, since a dense `build_neighborhood` materializes the
+  `(B, N, N)` distance matrix the field has no other use for.
+- **Learnable RBF centers and bandwidths.** The original kernel flow optimizes the Gaussian means
+  and widths alongside the mixing weights and reports the bandwidths as the knob controlling the
+  dynamics' complexity; `gaussian` here has fixed linearly-spaced centers.
