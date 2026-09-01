@@ -113,7 +113,7 @@ class RadialField(nn.Module):
         :param box: Per-node box lengths (N, 3), or None.
         :return: Velocity (N, 3) and one divergence per graph (num_graphs,)."""
 
-        edge_index, h_edge = build_edges(
+        edge_index, h_edge, static = build_edges(
             x,
             edge_index,
             h_edge,
@@ -139,6 +139,10 @@ class RadialField(nn.Module):
             d_env = polynomial_envelope_derivative(
                 dist, self.distance_cutoff, self.envelope_exponent
             )
+            # a static edge never enters or leaves at the cutoff, so it needs no taper; d_env must
+            # go to zero with it or the closed-form derivative stops matching the field.
+            env = torch.where(static[:, None], torch.ones_like(env), env)
+            d_env = torch.where(static[:, None], torch.zeros_like(d_env), d_env)
             b, db = env * b, d_env * b + env * db
 
         # summing the two endpoints keeps phi_ij == phi_ji, so the field stays the gradient

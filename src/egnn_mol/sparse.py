@@ -122,13 +122,17 @@ def build_edges(
     edge_dim: int = 0,
     distance_cutoff: float = 0.0,
     num_nearest_neighbors: int = 0,
-) -> tuple[Tensor, Tensor | None]:
+) -> tuple[Tensor, Tensor | None, Tensor]:
     """Union static bonds with internal distance-based (radius / kNN) edges.
 
     Dynamic edges get zero edge features; duplicates are coalesced (summing attributes, so
     static features survive). With no static edges and no distance graph the result is
     all-pairs within each graph. Shared by every packed backbone, so they provably see the
     same edge set for the same arguments.
+
+    The returned mask marks the edges the caller supplied. Those exist independently of the
+    positions, so nothing about them appears or disappears at a cutoff and there is nothing to
+    taper; :meth:`GeometricEGNN.edge_envelope` exempts them.
 
     :param x: Node positions (N, 3).
     :param edge_index: Static edge connectivity (2, E) as ``[source/neighbor, target/center]``,
@@ -139,7 +143,8 @@ def build_edges(
     :param edge_dim: Edge-feature width; 0 returns no edge features.
     :param distance_cutoff: If > 0, add a radius graph of dynamic edges.
     :param num_nearest_neighbors: If > 0, add a kNN graph of dynamic edges.
-    :return: The combined ``(edge_index, h_edge)``."""
+    :return: The combined ``(edge_index, h_edge, static)``, the last a per-edge mask (E,) that is
+        True on the caller-supplied edges."""
 
     n = x.shape[0]
     dynamic: list[Tensor] = []
@@ -152,16 +157,26 @@ def build_edges(
 
     indices = ([edge_index] if edge_index is not None else []) + dynamic
 
+    # the flag has to ride through `coalesce`, which re-sorts the edge index; a mask built
+    # beforehand would no longer line up with the rows it describes.
+    flags = [x.new_ones(edge_index.shape[1], 1)] if edge_index is not None else []
+    flags += [x.new_zeros(extra.shape[1], 1) for extra in dynamic]
+    flag = torch.cat(flags, dim=0)
+
     if edge_dim > 0:
         attrs = [h_edge] if edge_index is not None else []
         attrs += [x.new_zeros(extra.shape[1], edge_dim) for extra in dynamic]
-        return coalesce(
+        index, (h_edge, flag) = coalesce(
             torch.cat(indices, dim=1),
-            torch.cat(attrs, dim=0),
+            [torch.cat(attrs, dim=0), flag],
             num_nodes=n,
             reduce="sum",
         )
-    return coalesce(torch.cat(indices, dim=1), num_nodes=n), None
+        return index, h_edge, flag.squeeze(-1) > 0
+
+    index, flag = coalesce(torch.cat(indices, dim=1), flag, num_nodes=n, reduce="sum")
+
+    return index, None, flag.squeeze(-1) > 0
 
 
 class SparseEGNNLayer(nn.Module):
@@ -354,10 +369,17 @@ class GeometricEGNN(nn.Module):
         :param box: Per-node box lengths (N, 3), or None.
         :return: Updated features (N, dim) and positions (N, 3)."""
 
-        edge_index, h_edge = self.build_neighborhood(x, edge_index, h_edge, batch, box)
+        edge_index, h_edge, static = self.build_neighborhood(
+            x, edge_index, h_edge, batch, box
+        )
 
         return self.run_layers(
-            h_node, x, edge_index, h_edge, box, self.edge_envelope(x, edge_index, box)
+            h_node,
+            x,
+            edge_index,
+            h_edge,
+            box,
+            self.edge_envelope(x, edge_index, box, static),
         )
 
     def build_neighborhood(
@@ -367,7 +389,7 @@ class GeometricEGNN(nn.Module):
         h_edge: Tensor | None = None,
         batch: Tensor | None = None,
         box: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor | None]:
+    ) -> tuple[Tensor, Tensor | None, Tensor]:
         """Build the edge set the layers run on, from this module's own graph settings.
 
         Split out of :meth:`forward` so the divergence can colour exactly the edges the layers
@@ -378,7 +400,7 @@ class GeometricEGNN(nn.Module):
         :param h_edge: Static edge features (E, edge_dim), or None.
         :param batch: Graph membership (N,), or None for a single graph.
         :param box: Per-node box lengths (N, 3), or None.
-        :return: The combined ``(edge_index, h_edge)``."""
+        :return: The combined ``(edge_index, h_edge, static)``, see :func:`build_edges`."""
 
         return build_edges(
             x,
@@ -392,7 +414,11 @@ class GeometricEGNN(nn.Module):
         )
 
     def edge_envelope(
-        self, x: Tensor, edge_index: Tensor, box: Tensor | None = None
+        self,
+        x: Tensor,
+        edge_index: Tensor,
+        box: Tensor | None = None,
+        static: Tensor | None = None,
     ) -> Tensor | None:
         """The cutoff envelope of every edge, evaluated on the positions the edges were built from.
 
@@ -405,6 +431,7 @@ class GeometricEGNN(nn.Module):
         :param x: Node positions (N, 3), the ones the edge set was built from.
         :param edge_index: Edge connectivity (2, E).
         :param box: Per-node box lengths (N, 3), or None.
+        :param static: Per-edge mask (E,) of caller-supplied edges to exempt, or None.
         :return: Envelope weights (E, 1), or None when no envelope is configured."""
 
         if self.envelope_cutoff is None:
@@ -413,8 +440,15 @@ class GeometricEGNN(nn.Module):
         src, dst = edge_index[0], edge_index[1]
         rel_x = minimum_image(x[dst] - x[src], box[dst] if box is not None else None)
         dist = squared_distance(rel_x).clamp(min=1e-8).sqrt()
+        env = polynomial_envelope(dist, self.envelope_cutoff, self.envelope_exponent)
 
-        return polynomial_envelope(dist, self.envelope_cutoff, self.envelope_exponent)
+        # a static edge set is position-independent, so no edge enters or leaves at the cutoff and
+        # there is nothing to taper; tapering it would silently delete every static edge longer
+        # than the cutoff, which is exactly what a topological graph is for.
+        if static is not None:
+            env = torch.where(static[:, None], torch.ones_like(env), env)
+
+        return env
 
     def run_layers(
         self,
@@ -477,7 +511,7 @@ class GeometricEGNN(nn.Module):
 
         # edge_dim=0: the pattern is set by which edges exist, never by what they carry, and
         # asking for features here would oblige the caller to supply them.
-        edges, _ = build_edges(
+        edges, _, _ = build_edges(
             x,
             edge_index,
             None,
@@ -543,7 +577,9 @@ class GeometricEGNN(nn.Module):
         :return: Updated features (N, dim), positions (N, 3), and one divergence per graph
             (num_graphs,)."""
 
-        edge_index, h_edge = self.build_neighborhood(x, edge_index, h_edge, batch, box)
+        edge_index, h_edge, static = self.build_neighborhood(
+            x, edge_index, h_edge, batch, box
+        )
         colours = greedy_colouring(
             hop_closure(edge_index, x.shape[0], self.receptive_hops), x.shape[0]
         )
@@ -560,7 +596,7 @@ class GeometricEGNN(nn.Module):
                 edge_index,
                 h_edge,
                 box,
-                self.edge_envelope(x, edge_index, box),
+                self.edge_envelope(x, edge_index, box, static),
             )
             displacement = x_out - x
 

@@ -156,6 +156,30 @@ class TestClosedFormDivergence:
         # and the pair contributes nothing at all at the boundary.
         assert torch.allclose(v_out, torch.zeros_like(v_out), atol=1e-10)
 
+    def test_a_long_static_edge_contributes_and_stays_exact(self):
+        """A static edge beyond the cutoff must survive the envelope, closed form included.
+
+        The envelope tapers where the edge *set* changes, which a static edge never does. Exempting
+        it means ``env -> 1``, so its derivative must go to zero with it or the closed form stops
+        matching the field it claims the divergence of.
+
+        :return: None."""
+        cutoff = 1.0
+        h_node = torch.randn(3, 8, dtype=torch.float64)
+        t = torch.full((3, 1), 0.5, dtype=torch.float64)
+        pos = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.3, 0.0, 0.0], [2.5 * cutoff, 0.0, 0.0]], dtype=torch.float64
+        )
+        long_edge = torch.tensor([[0, 2], [2, 0]])
+        net = make_field(distance_cutoff=cutoff, cutoff=4.0)
+
+        x = pos.clone().requires_grad_(True)
+        v, div = net(h_node, x, t, edge_index=long_edge)
+        v_without = net(h_node, pos.clone().requires_grad_(True), t)[0]
+
+        assert not torch.allclose(v, v_without)
+        assert torch.allclose(div.squeeze(), autograd_trace(v, x), rtol=1e-9, atol=1e-9)
+
 
 class TestEquivariance:
     """E(3) equivariance of the velocity and invariance of the divergence."""

@@ -135,7 +135,7 @@ def _sparse_edges_from_adj(adj: torch.Tensor, dense_h_edge: torch.Tensor | None)
 @pytest.mark.parametrize("periodic", [False, True])
 @pytest.mark.parametrize("edge_dim", [0, 3])
 @pytest.mark.parametrize("tripp", [0, 2])
-@pytest.mark.parametrize("graph", ["bonds", "radius"])
+@pytest.mark.parametrize("graph", ["bonds", "radius", "bonds+radius"])
 @pytest.mark.parametrize("envelope", [False, True])
 def test_cross_backbone_agreement(periodic, edge_dim, tripp, graph, envelope):
     """Dense and sparse agree exactly with shared weights and the same unified graph.
@@ -144,15 +144,15 @@ def test_cross_backbone_agreement(periodic, edge_dim, tripp, graph, envelope):
     the E(3)/SE(3) term — the definitive proof that the two backbones implement one function."""
     if graph == "radius" and edge_dim:
         pytest.skip("dynamic edges carry no features; edge_dim only applies to static bonds")
-    if envelope and graph != "radius":
-        pytest.skip("the envelope tapers at distance_cutoff, which only the radius graph has")
+    if envelope and graph == "bonds":
+        pytest.skip("the envelope tapers at distance_cutoff, which only a radius graph has")
 
     torch.manual_seed(2)
     n, dim, depth = 7, 8, 2
     x = torch.rand(n, 3) * 4.0
     h_node = torch.randn(n, dim)
     box_row = torch.tensor([4.0, 4.5, 3.5])
-    distance_cutoff = 2.5 if graph == "radius" else 0.0
+    distance_cutoff = 0.0 if graph == "bonds" else 2.5
 
     common = dict(
         depth=depth,
@@ -169,7 +169,7 @@ def test_cross_backbone_agreement(periodic, edge_dim, tripp, graph, envelope):
         sl.core.load_state_dict(dl.core.state_dict())
 
     adj_mat = dense_h_edge = edge_index = h_edge = None
-    if graph == "bonds":
+    if graph != "radius":
         adj = torch.rand(n, n) > 0.4
         adj = (adj | adj.T) & ~torch.eye(n, dtype=torch.bool)
         adj_mat = adj

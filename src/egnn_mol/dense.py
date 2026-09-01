@@ -52,7 +52,7 @@ def build_neighborhood(
     mask: Tensor | None,
     distance_cutoff: float,
     num_nearest_neighbors: int,
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor]:
     """Build a padded neighborhood from static bonds and internal distance-based edges.
 
     The graph is the union of the static ``adj_mat`` edges, a radius graph (``distance_cutoff``),
@@ -65,7 +65,8 @@ def build_neighborhood(
     :param mask: Node validity mask (B, N), or None.
     :param distance_cutoff: Radius cutoff for dynamic edges (0 disables).
     :param num_nearest_neighbors: kNN degree for dynamic edges (0 disables).
-    :return: Neighbor indices (B, N, K) and a boolean edge-validity mask (B, N, K)."""
+    :return: Neighbor indices (B, N, K), a boolean edge-validity mask (B, N, K), and a mask
+        (B, N, K) marking the edges that came from ``adj_mat`` and so need no cutoff taper."""
 
     b, n, _ = x.shape
     device = x.device
@@ -80,14 +81,16 @@ def build_neighborhood(
             pair_valid = mask[:, :, None] & mask[:, None, :]
 
         graph = torch.zeros(b, n, n, dtype=torch.bool, device=device)
+        static = torch.zeros(b, n, n, dtype=torch.bool, device=device)
         active = adj_mat is not None or distance_cutoff > 0 or num_nearest_neighbors > 0
 
         if adj_mat is not None:
-            graph = graph | (
+            static = (
                 repeat(adj_mat.bool(), "i j -> b i j", b=b)
                 if adj_mat.dim() == 2
                 else adj_mat.bool()
             )
+            graph = graph | static
         if distance_cutoff > 0:
             graph = graph | (dist_sq < distance_cutoff**2)
         if num_nearest_neighbors > 0:
@@ -106,8 +109,9 @@ def build_neighborhood(
         order = graph.int().argsort(dim=-1, descending=True, stable=True)
         nbhd_indices = order[..., :k_max]
         nbhd_mask = torch.gather(graph, -1, nbhd_indices)
+        nbhd_static = torch.gather(static & ~eye & pair_valid, -1, nbhd_indices)
 
-    return nbhd_indices, nbhd_mask
+    return nbhd_indices, nbhd_mask, nbhd_static
 
 
 class DenseEGNNLayer(nn.Module):
@@ -365,12 +369,13 @@ class EGNN(nn.Module):
 
         nbhd_indices: Tensor | None = None
         nbhd_mask: Tensor | None = None
+        nbhd_static: Tensor | None = None
         if (
             adj_mat is not None
             or self.distance_cutoff > 0
             or self.num_nearest_neighbors > 0
         ):
-            nbhd_indices, nbhd_mask = build_neighborhood(
+            nbhd_indices, nbhd_mask, nbhd_static = build_neighborhood(
                 x,
                 box,
                 adj_mat,
@@ -381,7 +386,7 @@ class EGNN(nn.Module):
             if h_edge is not None:
                 h_edge = batched_index_select(h_edge, nbhd_indices, dim=2)
 
-        env = self.edge_envelope(x, box, nbhd_indices)
+        env = self.edge_envelope(x, box, nbhd_indices, nbhd_static)
 
         x_changes = [x]
         for layer in self.layers:
@@ -402,7 +407,11 @@ class EGNN(nn.Module):
         return h_node, x
 
     def edge_envelope(
-        self, x: Tensor, box: Tensor | None, nbhd_indices: Tensor | None
+        self,
+        x: Tensor,
+        box: Tensor | None,
+        nbhd_indices: Tensor | None,
+        nbhd_static: Tensor | None = None,
     ) -> Tensor | None:
         """The cutoff envelope of every edge, evaluated on the positions the edges were built from.
 
@@ -415,6 +424,7 @@ class EGNN(nn.Module):
         :param x: Node positions (B, N, 3), the ones the neighborhood was built from.
         :param box: Periodic box lengths (B, 3), or None.
         :param nbhd_indices: Neighbor indices (B, N, K), or None for all-pairs.
+        :param nbhd_static: Mask (B, N, K) of static edges to exempt from the taper, or None.
         :return: Envelope weights (B, N, K, 1) or (B, N, N, 1), or None when none is configured."""
 
         if self.envelope_cutoff is None:
@@ -430,5 +440,11 @@ class EGNN(nn.Module):
                 box_pairs,
             )
         dist = squared_distance(rel_x).clamp(min=1e-8).sqrt()
+        env = polynomial_envelope(dist, self.envelope_cutoff, self.envelope_exponent)
 
-        return polynomial_envelope(dist, self.envelope_cutoff, self.envelope_exponent)
+        # a static edge set is position-independent, so no edge enters or leaves at the cutoff and
+        # there is nothing to taper; see the sparse backbone's `edge_envelope`.
+        if nbhd_static is not None:
+            env = torch.where(nbhd_static[..., None], torch.ones_like(env), env)
+
+        return env

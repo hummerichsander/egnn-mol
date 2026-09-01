@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import Tensor
 
-from egnn_mol import GeometricEGNN, greedy_colouring, hop_closure
+from egnn_mol import GeometricEGNN, build_edges, greedy_colouring, hop_closure
 
 CUTOFF = 1.5
 
@@ -200,7 +200,7 @@ class TestReceptiveField:
         x = x.clone().requires_grad_(True)
         support = block_support(net(h_node, x)[1] - x, x)
 
-        edges, _ = net.build_neighborhood(x.detach())
+        edges, _, _ = net.build_neighborhood(x.detach())
         narrower = dense_pattern(
             hop_closure(edges, x.shape[0], net.receptive_hops - 1), x.shape[0]
         )
@@ -291,3 +291,98 @@ class TestEnvelope:
         """Without a distance cutoff there is no radius at which edges appear, so none to taper."""
         with pytest.raises(ValueError, match="distance_cutoff"):
             GeometricEGNN(depth=2, dim=8, encoding_features=6, envelope=True)
+
+    def test_a_long_static_edge_still_contributes(self):
+        """A static edge beyond the cutoff must survive the envelope, or a topological graph is lost.
+
+        The envelope exists to keep the field smooth where a *dynamic* edge appears. A static edge
+        set does not depend on the positions, so nothing appears or disappears and there is nothing
+        to taper -- tapering it would delete every bond longer than ``distance_cutoff``.
+
+        :return: None."""
+        h_node = torch.randn(3, 8, dtype=torch.float64)
+        x = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [2.5 * CUTOFF, 0.0, 0.0]], dtype=torch.float64
+        )
+        long_edge = torch.tensor([[0, 2], [2, 0]])
+        net = make_net(depth=1, envelope=True)
+
+        without = net(h_node, x)[1]
+        with_edge = net(h_node, x, long_edge)[1]
+
+        assert not torch.allclose(without, with_edge)
+
+    def test_a_purely_static_graph_is_unaffected_by_the_envelope(self):
+        """With no pair inside the cutoff, enveloping is a no-op -- the sharpest form of the claim.
+
+        :return: None."""
+        h_node = torch.randn(3, 8, dtype=torch.float64)
+        x = torch.tensor(
+            [[0.0, 0.0, 0.0], [2.0 * CUTOFF, 0.0, 0.0], [4.0 * CUTOFF, 0.0, 0.0]],
+            dtype=torch.float64,
+        )
+        edge_index = torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]])
+
+        enveloped = make_net(depth=2, envelope=True)(h_node, x, edge_index)[1]
+        plain = make_net(depth=2, envelope=False)(h_node, x, edge_index)[1]
+
+        assert torch.allclose(enveloped, plain)
+
+    @pytest.mark.parametrize("depth", [1, 2, 3])
+    def test_the_field_is_smooth_where_an_edge_appears_beside_a_static_edge(self, depth):
+        """Exempting static edges must not reintroduce a jump where a dynamic edge enters.
+
+        Continuity scaling, not a single jump measurement, is what catches this: halving the probe
+        step must halve the difference.
+
+        :param depth: Number of message-passing layers.
+        :return: None."""
+        torch.manual_seed(0)
+        h_node = torch.randn(3, 8, dtype=torch.float64)
+        static = torch.tensor([[0, 1], [1, 0]])
+        net = make_net(depth=depth, envelope=True)
+
+        def displacement(separation: float) -> Tensor:
+            x = torch.tensor(
+                [[0.0, 0.0, 0.0], [0.7, 0.0, 0.0], [separation, 0.0, 0.0]],
+                dtype=torch.float64,
+            )
+            return net(h_node, x, static)[1] - x
+
+        jumps = [
+            float((displacement(CUTOFF + eps) - displacement(CUTOFF - eps)).abs().max().detach())
+            for eps in (1e-4, 1e-5)
+        ]
+
+        assert jumps[0] / jumps[1] == pytest.approx(10.0, rel=0.05)
+
+    def test_the_static_mask_survives_coalesce(self):
+        """``coalesce`` re-sorts the edge index, so the mask must be built through it, not before.
+
+        A pair that is both static and inside the cutoff coalesces to one edge that is still
+        static, and its features are the static row plus the dynamic zeros.
+
+        :return: None."""
+        x = torch.tensor([[0.0, 0.0, 0.0], [0.5 * CUTOFF, 0.0, 0.0]], dtype=torch.float64)
+        edge_index = torch.tensor([[0, 1], [1, 0]])
+        h_edge = torch.tensor([[2.0, 3.0], [4.0, 5.0]], dtype=torch.float64)
+
+        edges, attrs, static = build_edges(
+            x, edge_index, h_edge, None, None, edge_dim=2, distance_cutoff=CUTOFF
+        )
+
+        assert edges.shape[1] == 2
+        assert static.all()
+        order = {(int(s), int(d)): k for k, (s, d) in enumerate(edges.t().tolist())}
+        assert torch.allclose(attrs[order[(0, 1)]], h_edge[0])
+        assert torch.allclose(attrs[order[(1, 0)]], h_edge[1])
+
+    def test_a_dynamic_edge_is_not_marked_static(self):
+        """The mask must distinguish the two sources, or the exemption would cover everything.
+
+        :return: None."""
+        x = torch.tensor([[0.0, 0.0, 0.0], [0.5 * CUTOFF, 0.0, 0.0]], dtype=torch.float64)
+
+        _, _, static = build_edges(x, None, None, None, None, distance_cutoff=CUTOFF)
+
+        assert not static.any()
