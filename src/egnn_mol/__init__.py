@@ -26,6 +26,7 @@ from .sparse import (
     radius_edges,
     radius_graph_pbc,
 )
+from .sparsity import greedy_colouring, hop_closure
 from .update import EquivariantUpdate
 
 __all__ = [
@@ -48,6 +49,8 @@ __all__ = [
     "fourier_derivative",
     "gaussian",
     "gaussian_derivative",
+    "greedy_colouring",
+    "hop_closure",
     "knn_edges",
     "knn_graph_pbc",
     "minimum_image",

@@ -136,13 +136,16 @@ def _sparse_edges_from_adj(adj: torch.Tensor, dense_h_edge: torch.Tensor | None)
 @pytest.mark.parametrize("edge_dim", [0, 3])
 @pytest.mark.parametrize("tripp", [0, 2])
 @pytest.mark.parametrize("graph", ["bonds", "radius"])
-def test_cross_backbone_agreement(periodic, edge_dim, tripp, graph):
+@pytest.mark.parametrize("envelope", [False, True])
+def test_cross_backbone_agreement(periodic, edge_dim, tripp, graph, envelope):
     """Dense and sparse agree exactly with shared weights and the same unified graph.
 
     Swept over static-bond vs internal-radius graphs, open/periodic boundaries, edge features, and
     the E(3)/SE(3) term — the definitive proof that the two backbones implement one function."""
     if graph == "radius" and edge_dim:
         pytest.skip("dynamic edges carry no features; edge_dim only applies to static bonds")
+    if envelope and graph != "radius":
+        pytest.skip("the envelope tapers at distance_cutoff, which only the radius graph has")
 
     torch.manual_seed(2)
     n, dim, depth = 7, 8, 2
@@ -158,6 +161,7 @@ def test_cross_backbone_agreement(periodic, edge_dim, tripp, graph):
         edge_dim=edge_dim,
         tripp_num_layers=tripp,
         distance_cutoff=distance_cutoff,
+        envelope=envelope,
     )
     dense = EGNN(**common).eval()
     sparse = GeometricEGNN(**common).eval()

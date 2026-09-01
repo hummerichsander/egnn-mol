@@ -126,6 +126,14 @@ The `forward` methods are the primary API. The two EGNNs return `(h_node, x)` an
 | `batch` | `(ΣN,)`, or `None` | Graph membership for a ragged batch. |
 | `box` | `(ΣN, 3)`, or `None` | Per-node periodic box lengths (`None` = open). |
 
+**`GeometricEGNN.forward_and_divergence`** — the same arguments, returning
+`(h_node, x, div)` where `div` is the exact divergence of the displacement field `x_out - x`,
+one value per graph. Takes one extra argument:
+
+| Argument | Shape | Description |
+|---|---|---|
+| `create_graph` | bool | Build the second-order graph so the divergence is itself differentiable. |
+
 **`RadialField.forward`** — packed graph tensors plus a time, returning `(v, div v)`:
 
 | Argument | Shape | Description |
@@ -159,7 +167,9 @@ and `dim` are required; everything else has a default. Extra arguments are forwa
 | `norm_displacement` | `False` | Direction-normalize displacement vectors in the position update (makes the update magnitude box-/bond-length independent). |
 | `norm_displacement_scale_init` | `1.0` | Initial scale of the `DisplacementNorm` (only used when `norm_displacement=True`). |
 | `x_weights_clamp_value` | `None` | Optional symmetric clamp `[-c, c]` on the per-edge position weights. |
-| `tripp_num_layers` | `0` | Depth of the triple-product MLP. `> 0` enables the SE(3) chirality term (see below); `0` keeps the update E(3)-equivariant. |
+| `tripp_num_layers` | `0` | Depth of the triple-product MLP. `> 0` enables the SE(3) chirality term (see below); `0` keeps the update E(3)-equivariant. Note it **doubles the receptive field** (see *Sparsity and the exact divergence*). |
+| `envelope` | `False` | Taper every edge's contribution to zero at `distance_cutoff`, keeping the field C¹ where an edge enters or leaves the radius graph. Off by default: a network trained without it computes a different function, so enabling it changes what an existing checkpoint evaluates. |
+| `envelope_exponent` | `6` | Exponent of that polynomial envelope. |
 
 ### `RadialField`
 
@@ -245,6 +255,51 @@ Every basis also ships its analytic derivative — `encode_distance_derivative`,
 autograd. A new encoding therefore needs both arms to be usable there. Note the bessel derivative
 carries a Taylor branch below `z = freq·d ≈ 0.1`: `z cos z - sin z` is a difference of two `O(z)`
 terms whose result is `O(z³/3)`, so the direct form keeps nothing of it in float32.
+
+## Sparsity and the exact divergence
+
+The edge set is built **once** per forward pass, by neighbor searches that return indices, and is
+then shared by every layer. Within one call the graph is therefore fixed, and `dx_out_i / dx_j`
+vanishes unless `j` is within `receptive_hops` of `i`:
+
+```
+receptive_hops = depth                 # E(3)
+receptive_hops = 2 * depth             # SE(3), tripp_num_layers > 0
+```
+
+A layer's feature update reads one hop, and so does its position update — unless the chirality
+term is on, in which case `x_weight` also sees `chi` at both endpoints, and `chi` is itself a
+one-hop aggregate. That is where the factor of two comes from.
+
+That pattern is what makes the trace of the Jacobian cheap. Colour the `receptive_hops`-hop
+closure so that no two nodes of a colour are within reach of each other, and one backward pass
+per (colour × axis) reads every diagonal block of that colour at once: the off-diagonal terms
+sharing a row are structurally zero, so they cannot contaminate the read-out. The count of
+colours tracks the size of a `receptive_hops` ball, not the system, so the cost stops scaling
+with `N`:
+
+```python
+net = GeometricEGNN(depth=2, dim=32, distance_cutoff=0.5, envelope=True, ...)
+
+colours = net.jacobian_colouring(x, edge_index, batch)   # (ΣN,) node groups
+h, x_out, div = net.forward_and_divergence(h_node, x, edge_index, batch=batch)
+```
+
+`3 * colours` backward passes instead of `3N`, and exact — unlike a Hutchinson estimate, whose
+noise survives exponentiation and biases any density built from it. `sparsity_pattern` returns
+the closure itself if you want to inspect or measure it.
+
+Two things to get right:
+
+- **Set `envelope=True`.** Without it an edge's contribution is `O(1)` at the cutoff, so the
+  field jumps as the edge set changes and there is no well-defined divergence to compute. The
+  envelope is evaluated once on the *input* positions and shared by every layer, exactly as the
+  edge set is; tapering each layer by its own distances instead reintroduces the jump from
+  depth 2 onward, because an edge that entered with zero weight has moved by the time the second
+  layer reads it.
+- **Never reuse a colouring across an edge-set change.** The graph is rebuilt from positions on
+  every call, and a newly-formed edge can put two same-coloured nodes within reach, silently
+  corrupting the trace. `forward_and_divergence` recolours per call for exactly this reason.
 
 ## E(3) vs SE(3)
 

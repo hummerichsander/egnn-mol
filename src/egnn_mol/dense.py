@@ -4,7 +4,7 @@ import torch
 from einops import rearrange, repeat
 from torch import Tensor, nn
 
-from .encodings import Encoding
+from .encodings import Encoding, polynomial_envelope
 from .geometry import minimum_image, signed_volume, squared_distance
 from .update import EquivariantUpdate
 
@@ -161,6 +161,7 @@ class DenseEGNNLayer(nn.Module):
         box: Tensor | None = None,
         nbhd_indices: Tensor | None = None,
         nbhd_mask: Tensor | None = None,
+        env: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Message-passing update over a neighborhood (or all-pairs, self-excluded, if none given).
 
@@ -172,6 +173,7 @@ class DenseEGNNLayer(nn.Module):
         :param box: Periodic box lengths (B, 3), or None.
         :param nbhd_indices: Precomputed neighbor indices (B, N, K), or None for all-pairs.
         :param nbhd_mask: Precomputed edge-validity mask (B, N, K), or None.
+        :param env: Per-edge cutoff envelope (B, N, K, 1), or None for an untapered update.
         :return: Updated features (B, N, dim) and positions (B, N, 3)."""
 
         box_pairs = _box_for_pairs(box)
@@ -196,7 +198,11 @@ class DenseEGNNLayer(nn.Module):
 
         edge_mask = self._edge_mask(mask, nbhd_indices, nbhd_mask, b, n, h_node.device)
 
+        # applied to the displacement and the message, the two quantities every aggregation
+        # here is built from, so an edge fades out of all three at once.
         normed = self.core.normalize_rel(rel_x)
+        if env is not None:
+            normed, m_ij = env * normed, env * m_ij
 
         if self.core.tripp:
             abc = self.core.triple_abc(m_ij)  # (B, N, K, 3)
@@ -286,6 +292,8 @@ class EGNN(nn.Module):
         distance_cutoff: float = 0.0,
         num_nearest_neighbors: int = 0,
         aggr: Aggregation = "sum",
+        envelope: bool = False,
+        envelope_exponent: int = 6,
         **kwargs,
     ) -> None:
         """Build the network.
@@ -299,11 +307,25 @@ class EGNN(nn.Module):
         :param distance_cutoff: If > 0, add a radius graph of dynamic edges.
         :param num_nearest_neighbors: If > 0, add a kNN graph of dynamic edges.
         :param aggr: Message aggregation onto nodes ("sum" or "mean").
+        :param envelope: Taper every edge's contribution to zero at ``distance_cutoff``, so the
+            field stays C^1 where an edge enters or leaves the radius graph. Off by default: a
+            network trained without it computes a different function, so turning it on silently
+            would change what an existing checkpoint evaluates.
+        :param envelope_exponent: Polynomial exponent of that envelope.
         :param kwargs: Extra keyword arguments forwarded to every :class:`DenseEGNNLayer`."""
 
         super().__init__()
         self.distance_cutoff = distance_cutoff
         self.num_nearest_neighbors = num_nearest_neighbors
+
+        if envelope and distance_cutoff <= 0:
+            raise ValueError(
+                "the envelope tapers edges at `distance_cutoff`, so it needs one; got "
+                f"distance_cutoff={distance_cutoff}."
+            )
+
+        self.envelope_cutoff = distance_cutoff if envelope else None
+        self.envelope_exponent = envelope_exponent
 
         self.layers = nn.ModuleList(
             [
@@ -359,6 +381,8 @@ class EGNN(nn.Module):
             if h_edge is not None:
                 h_edge = batched_index_select(h_edge, nbhd_indices, dim=2)
 
+        env = self.edge_envelope(x, box, nbhd_indices)
+
         x_changes = [x]
         for layer in self.layers:
             h_node, x = layer(
@@ -369,9 +393,42 @@ class EGNN(nn.Module):
                 box=box,
                 nbhd_indices=nbhd_indices,
                 nbhd_mask=nbhd_mask,
+                env=env,
             )
             x_changes.append(x)
 
         if return_x_changes:
             return h_node, x, x_changes
         return h_node, x
+
+    def edge_envelope(
+        self, x: Tensor, box: Tensor | None, nbhd_indices: Tensor | None
+    ) -> Tensor | None:
+        """The cutoff envelope of every edge, evaluated on the positions the edges were built from.
+
+        Evaluated **once**, on the input positions, and shared by every layer -- exactly as the
+        neighborhood is. Letting each layer taper by its own distances instead would break the
+        very continuity the envelope exists for: an edge appears at ``distance_cutoff`` with
+        zero weight, but by the second layer the pair has moved, so it would re-enter with a
+        finite weight and the field would jump as the neighborhood changed.
+
+        :param x: Node positions (B, N, 3), the ones the neighborhood was built from.
+        :param box: Periodic box lengths (B, 3), or None.
+        :param nbhd_indices: Neighbor indices (B, N, K), or None for all-pairs.
+        :return: Envelope weights (B, N, K, 1) or (B, N, N, 1), or None when none is configured."""
+
+        if self.envelope_cutoff is None:
+            return None
+
+        box_pairs = _box_for_pairs(box)
+        if nbhd_indices is not None:
+            x_j = batched_index_select(x, nbhd_indices, dim=1)
+            rel_x = minimum_image(rearrange(x, "b i d -> b i () d") - x_j, box_pairs)
+        else:
+            rel_x = minimum_image(
+                rearrange(x, "b i d -> b i () d") - rearrange(x, "b j d -> b () j d"),
+                box_pairs,
+            )
+        dist = squared_distance(rel_x).clamp(min=1e-8).sqrt()
+
+        return polynomial_envelope(dist, self.envelope_cutoff, self.envelope_exponent)
