@@ -19,11 +19,15 @@ class RadialField(nn.Module):
     """Equivariant radial velocity field with a closed-form divergence.
 
     Follows Köhler, Klein & Noé (https://arxiv.org/abs/2006.02425): every node moves along a
-    weighted sum of its relative-position vectors, ``v_i = sum_j phi(d_ij, t) r_ij``, whose
+    weighted sum of its relative-position vectors, ``v_i = sum_j phi(d_ij) r_ij``, whose
     divergence is available in closed form as ``sum_ij [d(phi)/d(d_ij) * d_ij + D * phi]``. Their
     derivation only touches the diagonal Jacobian blocks ``dv_i/dx_i``, so the closed form needs
-    nothing beyond ``phi`` reading positions solely through ``d_ij`` -- node features, edge
-    features and time may all condition it, since none of them depend on positions.
+    nothing beyond ``phi`` reading positions solely through ``d_ij`` -- node and edge features may
+    condition it freely, since neither depends on positions.
+
+    Time is one such feature and gets no argument of its own: a flow passes it in as an extra
+    node-feature channel, exactly as :class:`~egnn_mol.sparse.GeometricEGNN` requires, which is
+    what keeps the two backbones' ``forward`` signatures interchangeable.
 
     Two consequences worth knowing before using it. There is no ``depth``: stacking these updates
     would make the total Jacobian a *product*, whose log-determinant is not a sum of traces, so
@@ -39,7 +43,6 @@ class RadialField(nn.Module):
         encoding: Encoding = "gaussian",
         encoding_features: int = 16,
         cutoff: float = 10.0,
-        time_features: int = 10,
         m_dim: int = 64,
         head_depth: int = 2,
         edge_dim: int = 0,
@@ -49,12 +52,12 @@ class RadialField(nn.Module):
     ) -> None:
         """Build the field.
 
-        :param dim: Node feature dimensionality (features must already be this wide).
+        :param dim: Node feature dimensionality (features must already be this wide, time
+            channel included).
         :param encoding: Radial basis the pair weight is expanded in.
         :param encoding_features: Number of basis functions / frequency bands. With no depth to
             stack, this is the primary capacity knob.
         :param cutoff: Radial length scale of the encoding.
-        :param time_features: Number of Gaussian RBF centers spanning ``t`` in [0, 1].
         :param m_dim: Hidden width of the coefficient head.
         :param head_depth: Number of hidden blocks in the coefficient head. It never reads
             positions, so it may be as deep as wanted without touching the closed form.
@@ -69,14 +72,13 @@ class RadialField(nn.Module):
         self.encoding = encoding
         self.encoding_features = encoding_features
         self.cutoff = cutoff
-        self.time_features = time_features
         self.edge_dim = edge_dim
         self.distance_cutoff = distance_cutoff
         self.num_nearest_neighbors = num_nearest_neighbors
         self.envelope_exponent = envelope_exponent
 
         self.coefficients = MLP(
-            dim + time_features + edge_dim,
+            dim + edge_dim,
             m_dim,
             encoding_width(encoding, encoding_features),
             num_layers=head_depth,
@@ -92,7 +94,6 @@ class RadialField(nn.Module):
         self,
         h_node: Tensor,
         x: Tensor,
-        t: Tensor,
         edge_index: Tensor | None = None,
         h_edge: Tensor | None = None,
         batch: Tensor | None = None,
@@ -103,9 +104,8 @@ class RadialField(nn.Module):
         The divergence always comes back: it costs one derivative-basis evaluation and one dot
         product on top of the velocity, and a caller that drops it drops its graph with it.
 
-        :param h_node: Node features (N, dim).
+        :param h_node: Node features (N, dim), carrying the time channel if the caller uses one.
         :param x: Node positions (N, 3).
-        :param t: Per-node time (N, 1) or (N,), as ``box`` is per-node.
         :param edge_index: Static edge connectivity (2, E) as ``[source/neighbor, target/center]``,
             or None.
         :param h_edge: Static edge features (E, edge_dim), or None.
@@ -147,10 +147,7 @@ class RadialField(nn.Module):
 
         # summing the two endpoints keeps phi_ij == phi_ji, so the field stays the gradient
         # field of a pairwise potential as in the paper; the closed form holds either way.
-        parts = [
-            h_node[dst] + h_node[src],
-            encode_distance(t.view(-1, 1)[dst], "gaussian", self.time_features, 1.0),
-        ]
+        parts = [h_node[dst] + h_node[src]]
         if h_edge is not None:
             parts.append(h_edge)
         w = self.coefficients(torch.cat(parts, dim=-1))

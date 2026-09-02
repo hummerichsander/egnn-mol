@@ -78,19 +78,21 @@ h_node_out, x_out = net(
 )  # edge_index optional; radius graph built internally
 ```
 
-`RadialField` is a velocity field rather than a layer stack, so it takes a per-node time and
-returns the velocity together with its exact divergence — one scalar per graph:
+`RadialField` is a velocity field rather than a layer stack, so it returns the velocity together
+with its exact divergence — one scalar per graph. Its `forward` signature is otherwise identical to
+`GeometricEGNN`'s, time included: a flow writes `t` into an extra node-feature channel and widens
+`dim` by one.
 
 ```python
 from egnn_mol import RadialField
 
 net = RadialField(
-    dim=64, encoding="bessel", encoding_features=32, cutoff=1.0, distance_cutoff=1.0
+    dim=65, encoding="bessel", encoding_features=32, cutoff=1.0, distance_cutoff=1.0
 )
-h_node = torch.randn(100, 64)  # node features (ΣN, dim)
+h_node = torch.randn(100, 64)  # node features (ΣN, dim - 1)
 x = torch.randn(100, 3)  # positions (ΣN, 3)
-t = torch.full((100, 1), 0.5)  # per-node time, as box is per-node
-v, div = net(h_node, x, t, batch=batch)  # v: (ΣN, 3), div: (num_graphs,)
+t = torch.full((100, 1), 0.5)  # time, as one more node feature
+v, div = net(torch.cat([h_node, t], -1), x, batch=batch)  # v: (ΣN, 3), div: (num_graphs,)
 ```
 
 `div` equals the autograd trace of `dv/dx` to machine precision (`tests/test_radial.py`), so it
@@ -157,7 +159,7 @@ and `dim` are required; everything else has a default. Extra arguments are forwa
 | Name | Default | Description |
 |---|---|---|
 | `depth` | — | Number of message-passing layers. |
-| `dim` | — | Node feature width. Features must already be this wide (embed upstream). |
+| `dim` | — | Node feature width, time channel included. Features must already be this wide (embed upstream). |
 | `m_dim` | `16` | Hidden message width inside each layer. |
 | `edge_dim` | `0` | Static edge-feature width (`0` = no edge features). |
 | `aggr` | `"sum"` | Message aggregation onto nodes: `"sum"` or `"mean"`. |
@@ -177,14 +179,13 @@ and `dim` are required; everything else has a default. Extra arguments are forwa
 `Σ_ij [∂φ/∂d_ij · d_ij + D · φ]`. `φ` is **linear in the radial basis** — the coefficient head
 predicts the basis weights, never `φ` itself — which is what keeps `∂φ/∂d` an exact closed form
 rather than another autograd pass. Since the derivation only touches the diagonal Jacobian blocks
-`∂v_i/∂x_i`, `φ` may be conditioned on anything that does not read positions: node features, edge
-features and time all enter freely.
+`∂v_i/∂x_i`, `φ` may be conditioned on anything that does not read positions: node and edge
+features enter freely, and time rides in as one more node feature.
 
 | Name | Default | Description |
 |---|---|---|
-| `dim` | — | Node feature width. Features must already be this wide (embed upstream). |
+| `dim` | — | Node feature width, time channel included. Features must already be this wide (embed upstream). |
 | `encoding_features` | `16` | Basis width. With no `depth` to stack, this is the primary capacity knob. |
-| `time_features` | `10` | Gaussian RBF centers spanning `t` in `[0, 1]`. |
 | `m_dim` | `64` | Hidden width of the coefficient head. |
 | `head_depth` | `2` | Hidden blocks in the coefficient head. It never reads positions, so it may be arbitrarily deep without touching the closed form. |
 | `envelope_exponent` | `6` | Exponent of the polynomial envelope applied when `distance_cutoff > 0`. |
@@ -196,6 +197,8 @@ they do for the two EGNNs. Two arguments are **absent by construction**:
   log-determinant is not a sum of traces. The single pairwise sum is the whole receptive field, so
   `distance_cutoff` matters far more here than for a deep EGNN.
 - **`aggr`** — the divergence formula above is written for a sum.
+- **`t`** — time is a node feature like any other, which is what keeps this `forward` a drop-in
+  replacement for `GeometricEGNN`'s.
 
 With `distance_cutoff > 0` the polynomial envelope is applied automatically at that radius, so `φ`
 *and* `∂φ/∂d` vanish where edges enter and leave the graph. Without it the field would be
