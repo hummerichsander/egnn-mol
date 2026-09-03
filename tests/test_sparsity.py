@@ -2,7 +2,7 @@ import math
 
 import pytest
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 from egnn_mol import (
     GeometricEGNN,
@@ -270,21 +270,63 @@ class TestReceptiveField:
         assert (support & ~narrower).any()
 
 
+class TestMlpDepth:
+    """Depth inside a layer's own MLPs, which must buy capacity without widening anything."""
+
+    @pytest.mark.parametrize("mlp_depth", [1, 2, 3])
+    def test_deepens_every_layer_mlp(self, mlp_depth):
+        """A hidden block is one hidden layer, so a depth-d MLP holds d + 1 linears.
+
+        :param mlp_depth: Number of hidden blocks in the layer MLPs."""
+        core = make_net(mlp_depth=mlp_depth).layers[0].core
+
+        for mlp in (core.edge_mlp, core.node_mlp, core.x_mlp):
+            assert sum(isinstance(m, nn.Linear) for m in mlp.modules()) == mlp_depth + 1
+
+    def test_leaves_the_triple_product_depth_alone(self):
+        """``tripp_num_layers`` doubles as the SE(3) switch, so it keeps a depth of its own."""
+        core = make_net(mlp_depth=3, tripp_num_layers=1).layers[0].core
+
+        assert sum(isinstance(m, nn.Linear) for m in core.triple_mlp.modules()) == 2
+
+    @pytest.mark.parametrize("tripp", [0, 2])
+    def test_leaves_the_colouring_unchanged(self, chain, tripp):
+        """The whole point of the knob: no extra hop, hence no extra colour and no extra pass.
+
+        :param chain: Path-graph fixture.
+        :param tripp: Depth of the triple-product MLP."""
+        _, x = chain
+        shallow = make_net(mlp_depth=1, tripp_num_layers=tripp)
+        deep = make_net(mlp_depth=3, tripp_num_layers=tripp)
+
+        assert shallow.receptive_hops == deep.receptive_hops
+        assert int(shallow.jacobian_colouring(x).max()) == int(
+            deep.jacobian_colouring(x).max()
+        )
+
+
 class TestColouredDivergence:
     """The compressed divergence against a coordinate-at-a-time trace of the same field."""
 
     @pytest.mark.parametrize("envelope", [False, True])
+    @pytest.mark.parametrize("mlp_depth", [1, 2])
     @pytest.mark.parametrize("tripp", [0, 2])
     @pytest.mark.parametrize("depth", [1, 2, 3])
-    def test_matches_the_dense_trace(self, chain, depth, tripp, envelope):
+    def test_matches_the_dense_trace(self, chain, depth, tripp, mlp_depth, envelope):
         """Exact, not estimated: this must agree to machine precision, with no variance.
 
         :param chain: Path-graph fixture.
         :param depth: Number of message-passing layers.
         :param tripp: Depth of the triple-product MLP.
+        :param mlp_depth: Number of hidden blocks in the layer MLPs.
         :param envelope: Whether the cutoff envelope is on."""
         h_node, x = chain
-        net = make_net(depth=depth, tripp_num_layers=tripp, envelope=envelope)
+        net = make_net(
+            depth=depth,
+            tripp_num_layers=tripp,
+            mlp_depth=mlp_depth,
+            envelope=envelope,
+        )
 
         x_grad = x.clone().requires_grad_(True)
         reference = autograd_trace(net(h_node, x_grad)[1] - x_grad, x_grad)

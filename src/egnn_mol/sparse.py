@@ -200,6 +200,7 @@ class SparseEGNNLayer(nn.Module):
         dropout: float = 0.0,
         x_weights_clamp_value: float | None = None,
         tripp_num_layers: int = 0,
+        mlp_depth: int = 1,
     ) -> None:
         """See :class:`GeometricEGNN` for the shared arguments.
 
@@ -221,6 +222,7 @@ class SparseEGNNLayer(nn.Module):
             dropout=dropout,
             x_weights_clamp_value=x_weights_clamp_value,
             tripp_num_layers=tripp_num_layers,
+            mlp_depth=mlp_depth,
         )
 
     def forward(

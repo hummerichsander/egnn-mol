@@ -44,6 +44,7 @@ class EquivariantUpdate(nn.Module):
         dropout: float = 0.0,
         x_weights_clamp_value: float | None = None,
         tripp_num_layers: int = 0,
+        mlp_depth: int = 1,
     ) -> None:
         """Build the update.
 
@@ -60,7 +61,10 @@ class EquivariantUpdate(nn.Module):
         :param dropout: Dropout probability inside the MLPs.
         :param x_weights_clamp_value: Optional symmetric clamp on position weights.
         :param tripp_num_layers: Depth of the triple-product MLP; > 0 turns on the SE(3)
-            chirality term (0 keeps the update E(3)-equivariant)."""
+            chirality term (0 keeps the update E(3)-equivariant).
+        :param mlp_depth: Number of hidden blocks in the edge, node and position MLPs. It buys
+            capacity without widening the receptive field, so it leaves the Jacobian sparsity
+            pattern untouched."""
 
         super().__init__()
         self.encoding = encoding
@@ -76,6 +80,7 @@ class EquivariantUpdate(nn.Module):
             edge_input_dim,
             edge_input_dim * 2,
             m_dim,
+            num_layers=mlp_depth,
             dropout=dropout,
             final_activation=True,
         )
@@ -84,12 +89,18 @@ class EquivariantUpdate(nn.Module):
         )
 
         self.node_norm = nn.LayerNorm(dim) if norm_h_node else nn.Identity()
-        self.node_mlp = MLP(dim + m_dim, dim * 2, dim, dropout=dropout)
+        self.node_mlp = MLP(
+            dim + m_dim, dim * 2, dim, num_layers=mlp_depth, dropout=dropout
+        )
 
         # With the triple-product term the position head also sees the chirality scalar of
         # both endpoints, so its input widens by 2.
         self.x_mlp = MLP(
-            m_dim + (2 if self.tripp else 0), m_dim * 4, 1, dropout=dropout
+            m_dim + (2 if self.tripp else 0),
+            m_dim * 4,
+            1,
+            num_layers=mlp_depth,
+            dropout=dropout,
         )
         self.displacement_norm = (
             DisplacementNorm(scale_init=norm_displacement_scale_init)

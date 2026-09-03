@@ -186,3 +186,24 @@ def test_cross_backbone_agreement(periodic, edge_dim, tripp, graph, envelope):
 
     assert torch.allclose(x_d[0], x_s, atol=1e-5)
     assert torch.allclose(h_node_d[0], h_node_s, atol=1e-5)
+
+
+def test_cross_backbone_agreement_with_deep_mlps():
+    """Both layer classes must thread ``mlp_depth``, or their state dicts stop being swappable."""
+    torch.manual_seed(2)
+    n, dim = 7, 8
+    x = torch.rand(n, 3) * 4.0
+    h_node = torch.randn(n, dim)
+
+    common = dict(depth=2, dim=dim, m_dim=8, distance_cutoff=2.5, mlp_depth=3)
+    dense = EGNN(**common).eval()
+    sparse = GeometricEGNN(**common).eval()
+    for dl, sl in zip(dense.layers, sparse.layers):
+        sl.core.load_state_dict(dl.core.state_dict())
+
+    with torch.no_grad():
+        h_node_d, x_d = dense(h_node[None], x[None])
+        h_node_s, x_s = sparse(h_node, x)
+
+    assert torch.allclose(x_d[0], x_s, atol=1e-5)
+    assert torch.allclose(h_node_d[0], h_node_s, atol=1e-5)

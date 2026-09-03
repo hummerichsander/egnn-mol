@@ -135,6 +135,7 @@ class DenseEGNNLayer(nn.Module):
         soft_edges: bool = False,
         x_weights_clamp_value: float | None = None,
         tripp_num_layers: int = 0,
+        mlp_depth: int = 1,
     ) -> None:
         """See :class:`EGNN` for the meaning of the arguments."""
 
@@ -155,6 +156,7 @@ class DenseEGNNLayer(nn.Module):
             dropout=dropout,
             x_weights_clamp_value=x_weights_clamp_value,
             tripp_num_layers=tripp_num_layers,
+            mlp_depth=mlp_depth,
         )
 
     def forward(

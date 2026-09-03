@@ -163,6 +163,7 @@ and `dim` are required; everything else has a default. Extra arguments are forwa
 | `depth` | — | Number of message-passing layers. |
 | `dim` | — | Node feature width, time channel included. Features must already be this wide (embed upstream). |
 | `m_dim` | `16` | Hidden message width inside each layer. |
+| `mlp_depth` | `1` | Hidden blocks in each layer's edge, node and position MLPs. Buys capacity per layer rather than per hop: unlike `depth` and `tripp_num_layers` it does **not** change the receptive field or the Jacobian sparsity pattern. |
 | `edge_dim` | `0` | Static edge-feature width (`0` = no edge features). |
 | `aggr` | `"sum"` | Message aggregation onto nodes: `"sum"` or `"mean"`. |
 | `dropout` | `0.0` | Dropout probability inside the layer MLPs. |
