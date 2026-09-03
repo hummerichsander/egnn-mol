@@ -92,7 +92,9 @@ net = RadialField(
 h_node = torch.randn(100, 64)  # node features (ΣN, dim - 1)
 x = torch.randn(100, 3)  # positions (ΣN, 3)
 t = torch.full((100, 1), 0.5)  # time, as one more node feature
-v, div = net(torch.cat([h_node, t], -1), x, batch=batch)  # v: (ΣN, 3), div: (num_graphs,)
+
+# v: (ΣN, 3), div: (num_graphs,)
+v, div = net(torch.cat([h_node, t], -1), x, batch=batch)
 ```
 
 `div` equals the autograd trace of `dv/dx` to machine precision (`tests/test_radial.py`), so it
