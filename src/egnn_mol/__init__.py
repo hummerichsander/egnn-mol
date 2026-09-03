@@ -26,7 +26,7 @@ from .sparse import (
     radius_edges,
     radius_graph_pbc,
 )
-from .sparsity import greedy_colouring, hop_closure
+from .sparsity import composed_closure, greedy_colouring, hop_closure
 from .update import EquivariantUpdate
 
 __all__ = [
@@ -41,6 +41,7 @@ __all__ = [
     "bessel",
     "bessel_derivative",
     "build_edges",
+    "composed_closure",
     "cosine_envelope",
     "encode_distance",
     "encode_distance_derivative",

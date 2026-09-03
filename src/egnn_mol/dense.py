@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import Literal
 
 import torch
@@ -295,6 +296,7 @@ class EGNN(nn.Module):
         edge_dim: int = 0,
         distance_cutoff: float = 0.0,
         num_nearest_neighbors: int = 0,
+        dynamic_layers: Sequence[int] | None = None,
         aggr: Aggregation = "sum",
         envelope: bool = False,
         envelope_exponent: int = 6,
@@ -310,6 +312,8 @@ class EGNN(nn.Module):
         :param edge_dim: Static edge-feature dimensionality (0 if no edge features).
         :param distance_cutoff: If > 0, add a radius graph of dynamic edges.
         :param num_nearest_neighbors: If > 0, add a kNN graph of dynamic edges.
+        :param dynamic_layers: Indices of the layers that see the dynamic edges; the rest see the
+            static adjacency alone. None (the default) gives every layer the full neighborhood.
         :param aggr: Message aggregation onto nodes ("sum" or "mean").
         :param envelope: Taper every edge's contribution to zero at ``distance_cutoff``, so the
             field stays C^1 where an edge enters or leaves the radius graph. Off by default: a
@@ -321,6 +325,15 @@ class EGNN(nn.Module):
         super().__init__()
         self.distance_cutoff = distance_cutoff
         self.num_nearest_neighbors = num_nearest_neighbors
+
+        if dynamic_layers is not None:
+            dynamic_layers = tuple(sorted(set(dynamic_layers)))
+            if not all(0 <= layer < depth for layer in dynamic_layers):
+                raise ValueError(
+                    f"dynamic_layers must index the {depth} layers, got {dynamic_layers}."
+                )
+
+        self.dynamic_layers = dynamic_layers
 
         if envelope and distance_cutoff <= 0:
             raise ValueError(
@@ -388,8 +401,16 @@ class EGNN(nn.Module):
 
         env = self.edge_envelope(x, box, nbhd_indices, nbhd_static)
 
+        # a static-only layer drops the dynamic entries by masking them out of the aggregation;
+        # the envelope is already one on the static ones, so it needs no slice of its own.
+        static_mask = (
+            nbhd_mask & nbhd_static
+            if nbhd_mask is not None and nbhd_static is not None
+            else nbhd_mask
+        )
+
         x_changes = [x]
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
             h_node, x = layer(
                 h_node,
                 x,
@@ -397,7 +418,7 @@ class EGNN(nn.Module):
                 mask=mask,
                 box=box,
                 nbhd_indices=nbhd_indices,
-                nbhd_mask=nbhd_mask,
+                nbhd_mask=nbhd_mask if self.reads_dynamic(index) else static_mask,
                 env=env,
             )
             x_changes.append(x)
@@ -405,6 +426,14 @@ class EGNN(nn.Module):
         if return_x_changes:
             return h_node, x, x_changes
         return h_node, x
+
+    def reads_dynamic(self, layer: int) -> bool:
+        """Whether a layer sees the dynamic edges on top of the static adjacency.
+
+        :param layer: Index of the layer.
+        :return: True if it does."""
+
+        return self.dynamic_layers is None or layer in self.dynamic_layers
 
     def edge_envelope(
         self,

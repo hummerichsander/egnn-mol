@@ -15,13 +15,71 @@ def _binary_sparse(edge_index: Tensor, num_nodes: int) -> Tensor:
     ).coalesce()
 
 
-def hop_closure(edge_index: Tensor, num_nodes: int, hops: int) -> Tensor:
-    """Reachability within ``hops`` hops of the graph, self-loops included.
+def _adjacency(edge_index: Tensor, num_nodes: int) -> Tensor:
+    """The symmetrized adjacency of a graph, carrying every self-loop.
 
-    This is the sparsity pattern of a stacked backbone's position Jacobian. One layer carries
-    information one hop, so after ``hops`` layers the update at node ``i`` can only depend on
-    nodes at graph distance ``<= hops`` from it, and every other block of the Jacobian is
-    structurally zero.
+    :param edge_index: Edge connectivity (2, E); direction is ignored.
+    :param num_nodes: Number of nodes N.
+    :return: A coalesced sparse (N, N) tensor of ones."""
+
+    loops = torch.arange(num_nodes, device=edge_index.device).expand(2, num_nodes)
+
+    return _binary_sparse(
+        torch.cat([edge_index, edge_index.flip(0), loops], dim=1), num_nodes
+    )
+
+
+def composed_closure(edge_indices: list[Tensor], num_nodes: int) -> Tensor:
+    """Reachability through a sequence of graphs, one per hop, self-loops included.
+
+    This is the sparsity pattern of a stack whose layers do not all read the same edges: hop
+    ``l`` carries information one hop of ``edge_indices[l]``, so the update at node ``i`` can
+    only depend on nodes reached by walking one hop through each graph in turn. A composition
+    rather than a power, which is what lets a layer restricted to a small graph cost a small
+    ball while a layer on the full neighborhood still reaches all of its own neighbors.
+
+    Symmetrized at the end, and only there. A product of symmetric matrices is not itself
+    symmetric -- ``support(AB) = support(BA)^T`` -- so which end of the stack the walk starts
+    from decides the direction of the entries. Closing over both is what keeps the result a
+    valid colouring input (a colour class must be independent in *either* direction, since a
+    seeded neighbor contaminates the read-out whichever way the dependence runs), and it makes
+    the order of the sequence immaterial.
+
+    :param edge_indices: One edge index (2, E) per hop; direction is ignored.
+    :param num_nodes: Number of nodes N.
+    :return: Edge index (2, E') of the closure, symmetric and carrying every self-loop."""
+
+    if not edge_indices:
+        raise ValueError("at least one hop is needed, got none.")
+
+    # the same graph repeats across most of a stack, and building its adjacency is the expensive
+    # part; `hop_closure` is the extreme case of one graph repeated `hops` times.
+    closure = _adjacency(edge_indices[0], num_nodes)
+    cache = {id(edge_indices[0]): closure}
+
+    for edge_index in edge_indices[1:]:
+        if (key := id(edge_index)) not in cache:
+            cache[key] = _adjacency(edge_index, num_nodes)
+
+        # re-binarize each step: the products count paths, which overflows float32 quickly.
+        product = torch.sparse.mm(closure, cache[key]).coalesce()
+        closure = _binary_sparse(product.indices(), num_nodes)
+
+    indices = closure.indices()
+
+    return _binary_sparse(
+        torch.cat([indices, indices.flip(0)], dim=1), num_nodes
+    ).indices()
+
+
+def hop_closure(edge_index: Tensor, num_nodes: int, hops: int) -> Tensor:
+    """Reachability within ``hops`` hops of one graph, self-loops included.
+
+    This is the sparsity pattern of a stacked backbone whose layers all read the same edges. One
+    layer carries information one hop, so after ``hops`` layers the update at node ``i`` can only
+    depend on nodes at graph distance ``<= hops`` from it, and every other block of the Jacobian
+    is structurally zero. See :func:`composed_closure` for a stack that reads different edges in
+    different layers.
 
     Kept sparse throughout: a packed batch has ``num_nodes = B * N``, whose dense adjacency is
     quadratic in the batch size.
@@ -34,18 +92,7 @@ def hop_closure(edge_index: Tensor, num_nodes: int, hops: int) -> Tensor:
     if hops < 1:
         raise ValueError(f"hops must be at least one, got {hops}.")
 
-    loops = torch.arange(num_nodes, device=edge_index.device).expand(2, num_nodes)
-    adj = _binary_sparse(
-        torch.cat([edge_index, edge_index.flip(0), loops], dim=1), num_nodes
-    )
-
-    closure = adj
-    for _ in range(hops - 1):
-        # re-binarize each step: the products count paths, which overflows float32 quickly.
-        product = torch.sparse.mm(closure, adj).coalesce()
-        closure = _binary_sparse(product.indices(), num_nodes)
-
-    return closure.indices()
+    return composed_closure([edge_index] * hops, num_nodes)
 
 
 def greedy_colouring(edge_index: Tensor, num_nodes: int) -> Tensor:

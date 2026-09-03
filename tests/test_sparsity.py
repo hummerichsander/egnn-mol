@@ -4,7 +4,13 @@ import pytest
 import torch
 from torch import Tensor
 
-from egnn_mol import GeometricEGNN, build_edges, greedy_colouring, hop_closure
+from egnn_mol import (
+    GeometricEGNN,
+    build_edges,
+    composed_closure,
+    greedy_colouring,
+    hop_closure,
+)
 
 CUTOFF = 1.5
 
@@ -55,7 +61,9 @@ def chain() -> tuple[Tensor, Tensor]:
         [i * 1.0, 0.3 * math.cos(i * 2.0), 0.3 * math.sin(i * 2.0)] for i in range(n)
     ]
 
-    return torch.randn(n, 8, dtype=torch.float64), torch.tensor(turn, dtype=torch.float64)
+    return torch.randn(n, 8, dtype=torch.float64), torch.tensor(
+        turn, dtype=torch.float64
+    )
 
 
 def autograd_trace(v: Tensor, x: Tensor) -> Tensor:
@@ -132,6 +140,58 @@ class TestHopClosure:
             hop_closure(torch.tensor([[0], [1]]), 2, 0)
 
 
+class TestComposedClosure:
+    """Reachability through a sequence of different graphs, one per hop."""
+
+    def test_walks_one_hop_of_each_graph_in_turn(self):
+        """Composition, not union: (0, 2) needs one hop of each graph, and (0, 3) is out of reach."""
+        n = 4
+        first = torch.tensor([[0], [1]])
+        second = torch.tensor([[1], [2]])
+
+        closure = dense_pattern(composed_closure([first, second], n), n)
+
+        assert closure[0, 2] and closure[2, 0]
+        assert not closure[0, 3]
+
+    def test_does_not_depend_on_the_order(self):
+        """The closure is symmetrized, which is what makes the two orders agree."""
+        n = 5
+        path = torch.tensor([[0, 1, 2], [1, 2, 3]])
+        single = torch.tensor([[3], [4]])
+
+        forwards = dense_pattern(composed_closure([path, single], n), n)
+        backwards = dense_pattern(composed_closure([single, path], n), n)
+
+        assert torch.equal(forwards, backwards)
+
+    def test_is_symmetric(self):
+        """A colour class must be independent whichever way the dependence runs."""
+        n = 5
+        first = torch.tensor([[0], [1]])
+        second = torch.tensor([[1, 2], [2, 3]])
+
+        closure = dense_pattern(composed_closure([first, second], n), n)
+
+        assert torch.equal(closure, closure.T)
+
+    def test_repeating_one_graph_is_its_hop_closure(self):
+        """`hop_closure` is the homogeneous special case, and must stay exactly that."""
+        n = 8
+        idx = torch.arange(n - 1)
+        edge_index = torch.stack([idx, idx + 1])
+
+        composed = dense_pattern(composed_closure([edge_index] * 3, n), n)
+        homogeneous = dense_pattern(hop_closure(edge_index, n, 3), n)
+
+        assert torch.equal(composed, homogeneous)
+
+    def test_rejects_an_empty_sequence(self):
+        """No hops is not a pattern; the caller has confused it with an empty graph."""
+        with pytest.raises(ValueError, match="at least one"):
+            composed_closure([], 3)
+
+
 class TestGreedyColouring:
     """The property the compressed Jacobian rests on: colour classes are independent sets."""
 
@@ -163,7 +223,9 @@ class TestGreedyColouring:
 class TestReceptiveField:
     """The claimed hop count against the Jacobian the backbone actually has."""
 
-    @pytest.mark.parametrize("tripp,depth,hops", [(0, 1, 1), (0, 3, 3), (2, 1, 2), (2, 2, 4)])
+    @pytest.mark.parametrize(
+        "tripp,depth,hops", [(0, 1, 1), (0, 3, 3), (2, 1, 2), (2, 2, 4)]
+    )
     def test_hops_double_with_the_chirality_term(self, tripp, depth, hops):
         """`chi` is itself a one-hop aggregate, so it pushes the position update a hop further.
 
@@ -237,7 +299,9 @@ class TestColouredDivergence:
         n = x.shape[0]
         net = make_net(depth=2)
 
-        batch = torch.cat([torch.zeros(n, dtype=torch.long), torch.ones(n, dtype=torch.long)])
+        batch = torch.cat(
+            [torch.zeros(n, dtype=torch.long), torch.ones(n, dtype=torch.long)]
+        )
         packed_h = torch.cat([h_node, h_node])
         packed_x = torch.cat([x, x + 20.0])
 
@@ -281,7 +345,12 @@ class TestEnvelope:
             return net(h_node, x)[1] - x
 
         jumps = [
-            float((displacement(CUTOFF + eps) - displacement(CUTOFF - eps)).abs().max().detach())
+            float(
+                (displacement(CUTOFF + eps) - displacement(CUTOFF - eps))
+                .abs()
+                .max()
+                .detach()
+            )
             for eps in (1e-4, 1e-5)
         ]
 
@@ -302,7 +371,8 @@ class TestEnvelope:
         :return: None."""
         h_node = torch.randn(3, 8, dtype=torch.float64)
         x = torch.tensor(
-            [[0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [2.5 * CUTOFF, 0.0, 0.0]], dtype=torch.float64
+            [[0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [2.5 * CUTOFF, 0.0, 0.0]],
+            dtype=torch.float64,
         )
         long_edge = torch.tensor([[0, 2], [2, 0]])
         net = make_net(depth=1, envelope=True)
@@ -329,7 +399,9 @@ class TestEnvelope:
         assert torch.allclose(enveloped, plain)
 
     @pytest.mark.parametrize("depth", [1, 2, 3])
-    def test_the_field_is_smooth_where_an_edge_appears_beside_a_static_edge(self, depth):
+    def test_the_field_is_smooth_where_an_edge_appears_beside_a_static_edge(
+        self, depth
+    ):
         """Exempting static edges must not reintroduce a jump where a dynamic edge enters.
 
         Continuity scaling, not a single jump measurement, is what catches this: halving the probe
@@ -350,7 +422,12 @@ class TestEnvelope:
             return net(h_node, x, static)[1] - x
 
         jumps = [
-            float((displacement(CUTOFF + eps) - displacement(CUTOFF - eps)).abs().max().detach())
+            float(
+                (displacement(CUTOFF + eps) - displacement(CUTOFF - eps))
+                .abs()
+                .max()
+                .detach()
+            )
             for eps in (1e-4, 1e-5)
         ]
 
@@ -363,7 +440,9 @@ class TestEnvelope:
         static, and its features are the static row plus the dynamic zeros.
 
         :return: None."""
-        x = torch.tensor([[0.0, 0.0, 0.0], [0.5 * CUTOFF, 0.0, 0.0]], dtype=torch.float64)
+        x = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.5 * CUTOFF, 0.0, 0.0]], dtype=torch.float64
+        )
         edge_index = torch.tensor([[0, 1], [1, 0]])
         h_edge = torch.tensor([[2.0, 3.0], [4.0, 5.0]], dtype=torch.float64)
 
@@ -381,8 +460,142 @@ class TestEnvelope:
         """The mask must distinguish the two sources, or the exemption would cover everything.
 
         :return: None."""
-        x = torch.tensor([[0.0, 0.0, 0.0], [0.5 * CUTOFF, 0.0, 0.0]], dtype=torch.float64)
+        x = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.5 * CUTOFF, 0.0, 0.0]], dtype=torch.float64
+        )
 
         _, _, static = build_edges(x, None, None, None, None, distance_cutoff=CUTOFF)
 
         assert not static.any()
+
+
+class TestLayerSchedule:
+    """`dynamic_layers`: only some layers see the radius graph, so depth stops setting the ball."""
+
+    @pytest.fixture
+    def bonds(self) -> Tensor:
+        """Two isolated static bonds, far sparser than the radius graph on the same chain.
+
+        Sparser on purpose: a static graph that matched the radius graph would make a scheduled
+        stack indistinguishable from an unscheduled one.
+
+        :return: Edge index (2, 4)."""
+
+        return torch.tensor([[0, 1, 5, 6], [1, 0, 6, 5]])
+
+    @pytest.mark.parametrize("schedule", [(0,), (2,)])
+    @pytest.mark.parametrize("tripp", [0, 2])
+    def test_matches_the_dense_trace(self, chain, bonds, tripp, schedule):
+        """The composed pattern must still contain the whole Jacobian, or the trace is wrong.
+
+        :param chain: Path-graph fixture.
+        :param bonds: Static edge fixture.
+        :param tripp: Depth of the triple-product MLP.
+        :param schedule: Which layers read the dynamic edges."""
+        h_node, x = chain
+        net = make_net(depth=3, tripp_num_layers=tripp, dynamic_layers=schedule)
+
+        x_grad = x.clone().requires_grad_(True)
+        reference = autograd_trace(net(h_node, x_grad, bonds)[1] - x_grad, x_grad)
+
+        _, _, div = net.forward_and_divergence(h_node, x.clone(), bonds)
+
+        assert torch.allclose(div.squeeze(), reference, rtol=1e-9, atol=1e-9)
+
+    @pytest.mark.parametrize("tripp", [0, 2])
+    def test_the_jacobian_lives_inside_the_pattern(self, chain, bonds, tripp):
+        """Nothing outside the composed closure may be nonzero, or a colouring of it is invalid.
+
+        :param chain: Path-graph fixture.
+        :param bonds: Static edge fixture.
+        :param tripp: Depth of the triple-product MLP."""
+        h_node, x = chain
+        net = make_net(depth=3, tripp_num_layers=tripp, dynamic_layers=(1,))
+
+        x = x.clone().requires_grad_(True)
+        support = block_support(net(h_node, x, bonds)[1] - x, x)
+        pattern = dense_pattern(net.sparsity_pattern(x.detach(), bonds), x.shape[0])
+
+        assert not (support & ~pattern).any()
+
+    def test_the_dynamic_hop_is_still_needed(self, chain, bonds):
+        """Tightness in the direction that matters: dropping it must lose part of the support.
+
+        :param chain: Path-graph fixture.
+        :param bonds: Static edge fixture."""
+        h_node, x = chain
+        net = make_net(depth=3, dynamic_layers=(1,))
+
+        x = x.clone().requires_grad_(True)
+        support = block_support(net(h_node, x, bonds)[1] - x, x)
+        static_only = dense_pattern(
+            hop_closure(bonds, x.shape[0], net.receptive_hops), x.shape[0]
+        )
+
+        assert (support & ~static_only).any()
+
+    def test_costs_fewer_colours_than_the_unscheduled_stack(self, chain, bonds):
+        """The whole point: the same depth, over a smaller ball.
+
+        :param chain: Path-graph fixture.
+        :param bonds: Static edge fixture."""
+        _, x = chain
+        scheduled = make_net(depth=3, dynamic_layers=(0,))
+        every_layer = make_net(depth=3)
+
+        assert int(scheduled.jacobian_colouring(x, bonds).max()) < int(
+            every_layer.jacobian_colouring(x, bonds).max()
+        )
+
+    def test_an_empty_schedule_drops_the_radius_graph(self, chain, bonds):
+        """With no layer reading them, the dynamic edges must not reach the field at all.
+
+        The sharpest form of the claim: identical to a backbone built without a radius graph.
+
+        :param chain: Path-graph fixture.
+        :param bonds: Static edge fixture."""
+        h_node, x = chain
+
+        scheduled = make_net(depth=2, dynamic_layers=())(h_node, x, bonds)[1]
+        static_only = make_net(depth=2, distance_cutoff=0.0)(h_node, x, bonds)[1]
+
+        assert torch.allclose(scheduled, static_only, rtol=1e-9, atol=1e-9)
+
+    @pytest.mark.parametrize("depth", [2, 3])
+    def test_the_field_is_smooth_where_an_edge_appears(self, depth, bonds):
+        """A schedule must not reintroduce the jump the envelope exists to remove.
+
+        Continuity scaling again: halving the probe step must halve the difference. A layer
+        outside the schedule sees no dynamic edges at all, so the edge entering at the cutoff
+        reaches it through the enveloped layer alone.
+
+        :param depth: Number of message-passing layers.
+        :param bonds: Static edge fixture (unused pairs are ignored on three nodes)."""
+        torch.manual_seed(0)
+        h_node = torch.randn(3, 8, dtype=torch.float64)
+        static = torch.tensor([[0, 1], [1, 0]])
+        net = make_net(depth=depth, envelope=True, dynamic_layers=(0,))
+
+        def displacement(separation: float) -> Tensor:
+            x = torch.tensor(
+                [[0.0, 0.0, 0.0], [0.7, 0.0, 0.0], [separation, 0.0, 0.0]],
+                dtype=torch.float64,
+            )
+            return net(h_node, x, static)[1] - x
+
+        jumps = [
+            float(
+                (displacement(CUTOFF + eps) - displacement(CUTOFF - eps))
+                .abs()
+                .max()
+                .detach()
+            )
+            for eps in (1e-4, 1e-5)
+        ]
+
+        assert jumps[0] / jumps[1] == pytest.approx(10.0, rel=0.05)
+
+    def test_rejects_a_layer_that_does_not_exist(self):
+        """An index past the stack is a config error, not a silently ignored one."""
+        with pytest.raises(ValueError, match="dynamic_layers"):
+            GeometricEGNN(depth=2, dim=8, encoding_features=6, dynamic_layers=(2,))

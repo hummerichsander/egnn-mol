@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from egnn_mol import EGNN
@@ -71,3 +72,28 @@ def test_mask_ignores_padding(system):
         _, x_pert = net(h_node, perturbed, mask=mask, box=box)
     # Real nodes are unaffected by where the padded node sits.
     assert torch.allclose(x_ref[:, :-1], x_pert[:, :-1], atol=1e-5)
+
+
+def test_empty_schedule_drops_the_radius_graph(system):
+    h_node, x, box = system
+    n = x.shape[1]
+    ring = torch.eye(n, dtype=torch.bool).roll(1, 0)
+    adj = ring | ring.T
+
+    torch.manual_seed(0)
+    scheduled = EGNN(
+        depth=2, dim=8, m_dim=8, distance_cutoff=4.0, dynamic_layers=()
+    ).eval()
+    torch.manual_seed(0)
+    static_only = EGNN(depth=2, dim=8, m_dim=8).eval()  # no distance_cutoff at all
+
+    with torch.no_grad():
+        _, with_schedule = scheduled(h_node, x, adj_mat=adj, box=box)
+        _, without = static_only(h_node, x, adj_mat=adj, box=box)
+
+    assert torch.allclose(with_schedule, without, atol=1e-6)
+
+
+def test_schedule_rejects_a_layer_that_does_not_exist():
+    with pytest.raises(ValueError, match="dynamic_layers"):
+        EGNN(depth=2, dim=8, m_dim=8, dynamic_layers=(2,))

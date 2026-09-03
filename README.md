@@ -304,6 +304,33 @@ Two things to get right:
   every call, and a newly-formed edge can put two same-coloured nodes within reach, silently
   corrupting the trace. `forward_and_divergence` recolours per call for exactly this reason.
 
+### Separating the depth on dynamic and static edges
+
+The ball above is a ball in *space*, `receptive_hops * distance_cutoff` wide, so its colour count
+grows cubically with depth — which is what forces a colourable backbone to stay shallow. `dynamic_
+layers` breaks that link by naming the layers that see the radius graph; every other layer reads the
+caller's static graph alone:
+
+```python
+net = GeometricEGNN(depth=9, dim=32, distance_cutoff=0.4, dynamic_layers=(0,), envelope=True, ...)
+```
+
+A static hop spreads along the bonds instead of through space, and on a molecular system it cannot
+leave the molecule at all, so it is far cheaper: on a 10 000-atom hexadecane box, 32 static hops
+colour in 50 groups (200× fewer passes than the dense trace) while a single 0.4 nm dynamic hop
+already costs 16 on its own. Nine layers as `(8 static, 1 dynamic)` cost what two all-dynamic
+layers do.
+
+The sparsity pattern is then no longer a power of one adjacency but a composition of what each
+layer actually reads — `composed_closure` rather than `hop_closure` — which `sparsity_pattern` and
+`forward_and_divergence` build for you. Two consequences:
+
+- `receptive_hops` still counts the hops walked, but they are hops of different graphs, so it
+  becomes an upper bound on the reach through the full neighborhood rather than the reach itself.
+- Where in the stack the dynamic layers sit does not change the cost (the closure is symmetrized,
+  and the support of a product of symmetric graphs is order-invariant), only what the network can
+  express. `dynamic_layers=()` drops the radius graph from the field entirely.
+
 ## E(3) vs SE(3)
 
 By default the backbones are E(3)-equivariant. Passing `tripp_num_layers > 0` adds a

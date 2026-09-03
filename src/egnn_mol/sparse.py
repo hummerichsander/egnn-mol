@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import Literal
 
 import torch
@@ -7,7 +8,7 @@ from torch_geometric.utils import coalesce, scatter
 
 from .encodings import Encoding, polynomial_envelope
 from .geometry import minimum_image, signed_volume, squared_distance
-from .sparsity import greedy_colouring, hop_closure
+from .sparsity import composed_closure, greedy_colouring
 from .update import EquivariantUpdate
 
 Aggregation = Literal["sum", "mean"]
@@ -297,6 +298,7 @@ class GeometricEGNN(nn.Module):
         edge_dim: int = 0,
         distance_cutoff: float = 0.0,
         num_nearest_neighbors: int = 0,
+        dynamic_layers: Sequence[int] | None = None,
         aggr: Aggregation = "sum",
         envelope: bool = False,
         envelope_exponent: int = 6,
@@ -312,6 +314,11 @@ class GeometricEGNN(nn.Module):
         :param edge_dim: Static edge-feature dimensionality (0 if no edge features).
         :param distance_cutoff: If > 0, add a radius graph of dynamic edges.
         :param num_nearest_neighbors: If > 0, add a kNN graph of dynamic edges.
+        :param dynamic_layers: Indices of the layers that see the dynamic edges; the rest see the
+            static graph alone. None (the default) gives every layer the full neighborhood. The
+            dynamic edges are what make the position Jacobian's sparsity pattern a ball of radius
+            ``receptive_hops * distance_cutoff``, so restricting them to a few layers decouples
+            the depth of the stack from the radius of that ball.
         :param aggr: Message aggregation onto nodes ("sum" or "mean").
         :param envelope: Taper every edge's contribution to zero at ``distance_cutoff``, so the
             field stays C^1 where an edge enters or leaves the radius graph. Off by default: a
@@ -324,6 +331,15 @@ class GeometricEGNN(nn.Module):
         self.edge_dim = edge_dim
         self.distance_cutoff = distance_cutoff
         self.num_nearest_neighbors = num_nearest_neighbors
+
+        if dynamic_layers is not None:
+            dynamic_layers = tuple(sorted(set(dynamic_layers)))
+            if not all(0 <= layer < depth for layer in dynamic_layers):
+                raise ValueError(
+                    f"dynamic_layers must index the {depth} layers, got {dynamic_layers}."
+                )
+
+        self.dynamic_layers = dynamic_layers
 
         if envelope and distance_cutoff <= 0:
             raise ValueError(
@@ -380,6 +396,7 @@ class GeometricEGNN(nn.Module):
             h_edge,
             box,
             self.edge_envelope(x, edge_index, box, static),
+            static,
         )
 
     def build_neighborhood(
@@ -458,6 +475,7 @@ class GeometricEGNN(nn.Module):
         h_edge: Tensor | None,
         box: Tensor | None,
         env: Tensor | None = None,
+        static: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Run every message-passing layer on an already-built edge set.
 
@@ -467,12 +485,79 @@ class GeometricEGNN(nn.Module):
         :param h_edge: Edge features (E, edge_dim), or None.
         :param box: Per-node box lengths (N, 3), or None.
         :param env: Per-edge cutoff envelope (E, 1), or None.
+        :param static: Per-edge mask (E,) of the caller-supplied edges, needed only to honour
+            ``dynamic_layers``; without it every layer reads the full edge set.
         :return: Updated features (N, dim) and positions (N, 3)."""
 
-        for layer in self.layers:
-            h_node, x = layer(h_node, x, edge_index, h_edge, box=box, env=env)
+        for layer, (edges, features, envelope) in zip(
+            self.layers, self.layer_edges(edge_index, h_edge, env, static)
+        ):
+            h_node, x = layer(h_node, x, edges, features, box=box, env=envelope)
 
         return h_node, x
+
+    def reads_dynamic(self, layer: int) -> bool:
+        """Whether a layer sees the dynamic edges on top of the static graph.
+
+        :param layer: Index of the layer.
+        :return: True if it does."""
+
+        return self.dynamic_layers is None or layer in self.dynamic_layers
+
+    def layer_edges(
+        self,
+        edge_index: Tensor,
+        h_edge: Tensor | None,
+        env: Tensor | None,
+        static: Tensor | None,
+    ) -> list[tuple[Tensor, Tensor | None, Tensor | None]]:
+        """The edge set every layer runs on, one entry per layer.
+
+        A static-only layer carries no envelope: :meth:`edge_envelope` exempts static edges
+        anyway, so its slice of ``env`` is all ones.
+
+        :param edge_index: The full edge connectivity (2, E).
+        :param h_edge: The full edge features (E, edge_dim), or None.
+        :param env: The full per-edge envelope (E, 1), or None.
+        :param static: Per-edge mask (E,) of the caller-supplied edges, or None.
+        :return: One ``(edge_index, h_edge, env)`` triple per layer."""
+
+        full = (edge_index, h_edge, env)
+        if self.dynamic_layers is None or static is None:
+            return [full] * len(self.layers)
+
+        # sliced once here rather than per layer: every static-only layer reads this same view.
+        bonded = (
+            edge_index[:, static],
+            h_edge[static] if h_edge is not None else None,
+            None,
+        )
+
+        return [
+            full if self.reads_dynamic(layer) else bonded
+            for layer in range(len(self.layers))
+        ]
+
+    def layer_adjacencies(self, edge_index: Tensor, static: Tensor) -> list[Tensor]:
+        """One edge index per hop of the stack, in order, for the composed sparsity pattern.
+
+        A layer reads one hop of its own edge set, or two with the SE(3) chirality term -- see
+        :attr:`receptive_hops` for that recursion. A layer outside ``dynamic_layers`` therefore
+        contributes hops of the static graph rather than of the full neighborhood, which is what
+        keeps the composed ball small while the stack stays deep.
+
+        :param edge_index: The full edge connectivity (2, E).
+        :param static: Per-edge mask (E,) of the caller-supplied edges.
+        :return: One edge index per hop."""
+
+        hops = 2 if self.layers[0].core.tripp else 1
+        bonded = edge_index[:, static]
+
+        return [
+            edge_index if self.reads_dynamic(layer) else bonded
+            for layer in range(len(self.layers))
+            for _ in range(hops)
+        ]
 
     @property
     def receptive_hops(self) -> int:
@@ -485,6 +570,10 @@ class GeometricEGNN(nn.Module):
         ``a_l = max(a, b)_{l-1} + (2 if tripp else 1)`` and ``b_l = max(a, b)_{l-1} + 1``, so
         after ``depth`` layers the positions reach ``2 * depth`` hops with the chirality term
         and ``depth`` without.
+
+        With ``dynamic_layers`` set this is still the number of hops walked, but they are no
+        longer hops of one graph, so it is only an upper bound on the reach through the full
+        neighborhood; :meth:`sparsity_pattern` composes the per-layer graphs instead.
 
         :return: The number of hops."""
 
@@ -501,7 +590,9 @@ class GeometricEGNN(nn.Module):
 
         The edge set is built once per forward pass by non-differentiable neighbor searches and
         shared by every layer, so within one call the graph is fixed and ``dx_out_i / dx_j``
-        vanishes structurally beyond :attr:`receptive_hops`.
+        vanishes structurally beyond the reach of the stack -- :attr:`receptive_hops` hops of the
+        full neighborhood, or, under ``dynamic_layers``, the composition of what each layer
+        actually reads.
 
         :param x: Node positions (N, 3).
         :param edge_index: Static edge connectivity (2, E), or None.
@@ -511,7 +602,7 @@ class GeometricEGNN(nn.Module):
 
         # edge_dim=0: the pattern is set by which edges exist, never by what they carry, and
         # asking for features here would oblige the caller to supply them.
-        edges, _, _ = build_edges(
+        edges, _, static = build_edges(
             x,
             edge_index,
             None,
@@ -522,7 +613,7 @@ class GeometricEGNN(nn.Module):
             num_nearest_neighbors=self.num_nearest_neighbors,
         )
 
-        return hop_closure(edges, x.shape[0], self.receptive_hops)
+        return composed_closure(self.layer_adjacencies(edges, static), x.shape[0])
 
     def jacobian_colouring(
         self,
@@ -581,7 +672,8 @@ class GeometricEGNN(nn.Module):
             x, edge_index, h_edge, batch, box
         )
         colours = greedy_colouring(
-            hop_closure(edge_index, x.shape[0], self.receptive_hops), x.shape[0]
+            composed_closure(self.layer_adjacencies(edge_index, static), x.shape[0]),
+            x.shape[0],
         )
 
         graph = batch if batch is not None else torch.zeros_like(colours)
@@ -597,6 +689,7 @@ class GeometricEGNN(nn.Module):
                 h_edge,
                 box,
                 self.edge_envelope(x, edge_index, box, static),
+                static,
             )
             displacement = x_out - x
 
