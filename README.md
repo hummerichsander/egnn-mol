@@ -105,7 +105,9 @@ drops straight into `d/dt log p = -div v` with no Hutchinson estimator.
 The `forward` methods are the primary API. The two EGNNs return `(h_node, x)` and need only
 `h_node` and `x`; `RadialField` returns `(v, div v)` and additionally needs `t`. Static edges
 (bonds) are optional inputs; the distance-based (dynamic) graph is configured at construction
-(`distance_cutoff` / `num_nearest_neighbors`).
+(`distance_cutoff` / `num_nearest_neighbors`). The graph is rebuilt from positions on every
+call, so **`distance_cutoff` may also be passed per call** to resize the neighborhood without
+building a new module — `num_nearest_neighbors` stays construction-only.
 
 **`EGNN.forward`** — dense padded tensors:
 
@@ -118,6 +120,7 @@ The `forward` methods are the primary API. The two EGNNs return `(h_node, x)` an
 | `mask` | `(B, N)`, or `None` | Node validity mask (padding). |
 | `box` | `(B, 3)`, or `None` | Periodic box lengths (`None` = open boundaries). |
 | `return_x_changes` | bool | Also return the per-layer position trajectory. |
+| `distance_cutoff` | float, or `None` | Radius of the dynamic graph for this call, overriding the constructed one. The envelope tapers at the same radius. |
 
 **`GeometricEGNN.forward`** — packed graph tensors:
 
@@ -129,6 +132,7 @@ The `forward` methods are the primary API. The two EGNNs return `(h_node, x)` an
 | `h_edge` | `(E, edge_dim)`, or `None` | Static edge features. |
 | `batch` | `(ΣN,)`, or `None` | Graph membership for a ragged batch. |
 | `box` | `(ΣN, 3)`, or `None` | Per-node periodic box lengths (`None` = open). |
+| `distance_cutoff` | float, or `None` | Radius of the dynamic graph for this call, overriding the constructed one. The envelope tapers at the same radius. |
 
 **`GeometricEGNN.forward_and_divergence`** — the same arguments, returning
 `(h_node, x, div)` where `div` is the exact divergence of the displacement field `x_out - x`,
@@ -137,6 +141,10 @@ one value per graph. Takes one extra argument:
 | Argument | Shape | Description |
 |---|---|---|
 | `create_graph` | bool | Build the second-order graph so the divergence is itself differentiable. |
+| `distance_cutoff` | float, or `None` | As above. The colouring is taken from the edges this radius produced, so it follows on its own. |
+
+`sparsity_pattern` and `jacobian_colouring` take `distance_cutoff` too, so a radius can be
+priced before it is run at.
 
 **`RadialField.forward`** — packed graph tensors plus a time, returning `(v, div v)`:
 
@@ -149,6 +157,7 @@ one value per graph. Takes one extra argument:
 | `h_edge` | `(E, edge_dim)`, or `None` | Static edge features. |
 | `batch` | `(ΣN,)`, or `None` | Graph membership for a ragged batch. |
 | `box` | `(ΣN, 3)`, or `None` | Per-node periodic box lengths (`None` = open). |
+| `distance_cutoff` | float, or `None` | As above; the envelope **and its derivative** taper at that radius, so the closed form keeps matching the field. There is no separate envelope flag here, so `0.0` drops the radius graph and its taper together. |
 
 ## Hyperparameters
 
@@ -216,7 +225,7 @@ graphs; self-loops are always excluded. With none of the three below active it i
 | Name | Default | Description |
 |---|---|---|
 | static edges | *(forward input)* | Molecular bonds, passed at call time — dense `adj_mat`/`h_edge`, sparse `edge_index`/`h_edge`. |
-| `distance_cutoff` | `0.0` | If `> 0`, add a **radius graph** (all pairs within the cutoff), built internally from positions. |
+| `distance_cutoff` | `0.0` | If `> 0`, add a **radius graph** (all pairs within the cutoff), built internally from positions. Overridable per call — see *Forward API*. |
 | `num_nearest_neighbors` | `0` | If `> 0`, add a **kNN graph**, built internally from positions. |
 
 ### Edge features
@@ -305,7 +314,10 @@ Two things to get right:
   layer reads it.
 - **Never reuse a colouring across an edge-set change.** The graph is rebuilt from positions on
   every call, and a newly-formed edge can put two same-coloured nodes within reach, silently
-  corrupting the trace. `forward_and_divergence` recolours per call for exactly this reason.
+  corrupting the trace. `forward_and_divergence` recolours per call for exactly this reason —
+  which is also why a per-call `distance_cutoff` needs no care here: the colouring is taken from
+  the edges that radius produced, so it widens with it. Pass the same radius to
+  `sparsity_pattern` to price it first, since a wider ball costs more colours.
 
 ### Separating the depth on dynamic and static edges
 

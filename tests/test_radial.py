@@ -302,3 +302,68 @@ class TestTimeAsANodeFeature:
         )
 
         assert torch.allclose(div.squeeze(), autograd_trace(v, x), rtol=1e-9, atol=1e-9)
+
+
+class TestPerCallCutoff:
+    """The radius may be given per call; the envelope and its derivative must follow it."""
+
+    def test_matches_a_field_built_at_that_radius(self):
+        """The override changes the neighborhood and nothing else."""
+        common = dict(cutoff=3.0)
+        built_at_1 = make_field(distance_cutoff=1.0, **common)
+        built_at_3 = make_field(distance_cutoff=3.0, **common)
+        built_at_3.load_state_dict(built_at_1.state_dict())
+        h_node = torch.randn(6, 8, dtype=torch.float64)
+        x = torch.rand(6, 3, dtype=torch.float64) * 2.5
+
+        v, div = built_at_1(h_node, x, distance_cutoff=3.0)
+        v_ref, div_ref = built_at_3(h_node, x)
+        v_narrow, _ = built_at_1(h_node, x)
+
+        assert torch.allclose(v, v_ref)
+        assert torch.allclose(div, div_ref)
+        assert not torch.allclose(v, v_narrow)
+
+    def test_the_closed_form_stays_exact(self):
+        """``env`` and ``d_env`` must taper at the *same* radius, or the closed form drifts.
+
+        This is the test that catches a per-call radius reaching ``polynomial_envelope`` but not
+        ``polynomial_envelope_derivative``: the field would still look plausible while its
+        reported divergence quietly stopped being the divergence of it."""
+        net = make_field(distance_cutoff=1.0, cutoff=3.0)
+        h_node = torch.randn(6, 8, dtype=torch.float64)
+        x = (torch.rand(6, 3, dtype=torch.float64) * 2.5).requires_grad_(True)
+
+        v, div = net(h_node, x, distance_cutoff=2.5)
+
+        assert torch.allclose(div.squeeze(), autograd_trace(v, x), rtol=1e-9, atol=1e-9)
+
+    def test_continuous_across_the_overridden_boundary(self):
+        """An edge crossing the *called* radius must still be a no-op, not the built one."""
+        net = make_field(distance_cutoff=0.4, cutoff=1.0)
+        h_node = torch.randn(2, 8, dtype=torch.float64)
+        radius, eps = 1.0, 1e-7
+
+        out = []
+        for d in (radius - eps, radius + eps):
+            x = torch.tensor([[0.0, 0.0, 0.0], [d, 0.0, 0.0]], dtype=torch.float64)
+            out.append(net(h_node, x, distance_cutoff=radius))
+
+        (v_in, div_in), (v_out, div_out) = out
+        assert torch.allclose(v_in, v_out, atol=1e-10)
+        assert torch.allclose(div_in, div_out, atol=1e-10)
+
+    def test_a_zero_radius_drops_the_dynamic_graph(self):
+        """No envelope flag here, so 0.0 legitimately leaves the static edges alone."""
+        net = make_field(distance_cutoff=1.0, cutoff=3.0)
+        h_node = torch.randn(3, 8, dtype=torch.float64)
+        pos = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.3, 0.0, 0.0], [0.6, 0.0, 0.0]], dtype=torch.float64
+        )
+        bond = torch.tensor([[0, 1], [1, 0]])
+
+        x = pos.clone().requires_grad_(True)
+        v, div = net(h_node, x, edge_index=bond, distance_cutoff=0.0)
+
+        assert not torch.allclose(v, net(h_node, pos.clone(), edge_index=bond)[0])
+        assert torch.allclose(div.squeeze(), autograd_trace(v, x), rtol=1e-9, atol=1e-9)

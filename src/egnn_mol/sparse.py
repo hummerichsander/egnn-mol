@@ -375,6 +375,7 @@ class GeometricEGNN(nn.Module):
         h_edge: Tensor | None = None,
         batch: Tensor | None = None,
         box: Tensor | None = None,
+        distance_cutoff: float | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Run all message-passing layers on a packed graph.
 
@@ -385,10 +386,14 @@ class GeometricEGNN(nn.Module):
         :param h_edge: Static edge features (E, edge_dim), or None.
         :param batch: Graph membership (N,), or None for a single graph.
         :param box: Per-node box lengths (N, 3), or None.
+        :param distance_cutoff: Radius of the dynamic graph for this call, overriding the
+            constructed one; None uses it. The envelope tapers at the same radius, so the field
+            stays C^1 where an edge enters or leaves. The encoding length scale ``cutoff`` is
+            unaffected -- a radius past it aliases long edges onto short-range basis values.
         :return: Updated features (N, dim) and positions (N, 3)."""
 
         edge_index, h_edge, static = self.build_neighborhood(
-            x, edge_index, h_edge, batch, box
+            x, edge_index, h_edge, batch, box, distance_cutoff
         )
 
         return self.run_layers(
@@ -397,7 +402,7 @@ class GeometricEGNN(nn.Module):
             edge_index,
             h_edge,
             box,
-            self.edge_envelope(x, edge_index, box, static),
+            self.edge_envelope(x, edge_index, box, static, distance_cutoff),
             static,
         )
 
@@ -408,8 +413,9 @@ class GeometricEGNN(nn.Module):
         h_edge: Tensor | None = None,
         batch: Tensor | None = None,
         box: Tensor | None = None,
+        distance_cutoff: float | None = None,
     ) -> tuple[Tensor, Tensor | None, Tensor]:
-        """Build the edge set the layers run on, from this module's own graph settings.
+        """Build the edge set the layers run on, from this module's graph settings or a given radius.
 
         Split out of :meth:`forward` so the divergence can colour exactly the edges the layers
         went on to see, rather than a reconstruction of them.
@@ -419,6 +425,10 @@ class GeometricEGNN(nn.Module):
         :param h_edge: Static edge features (E, edge_dim), or None.
         :param batch: Graph membership (N,), or None for a single graph.
         :param box: Per-node box lengths (N, 3), or None.
+        :param distance_cutoff: Radius of the dynamic graph for this call, overriding the
+            constructed one; None uses it. The envelope tapers at the same radius, so the field
+            stays C^1 where an edge enters or leaves. The encoding length scale ``cutoff`` is
+            unaffected -- a radius past it aliases long edges onto short-range basis values.
         :return: The combined ``(edge_index, h_edge, static)``, see :func:`build_edges`."""
 
         return build_edges(
@@ -428,7 +438,9 @@ class GeometricEGNN(nn.Module):
             batch,
             box,
             edge_dim=self.edge_dim,
-            distance_cutoff=self.distance_cutoff,
+            distance_cutoff=(
+                self.distance_cutoff if distance_cutoff is None else distance_cutoff
+            ),
             num_nearest_neighbors=self.num_nearest_neighbors,
         )
 
@@ -438,6 +450,7 @@ class GeometricEGNN(nn.Module):
         edge_index: Tensor,
         box: Tensor | None = None,
         static: Tensor | None = None,
+        distance_cutoff: float | None = None,
     ) -> Tensor | None:
         """The cutoff envelope of every edge, evaluated on the positions the edges were built from.
 
@@ -451,15 +464,25 @@ class GeometricEGNN(nn.Module):
         :param edge_index: Edge connectivity (2, E).
         :param box: Per-node box lengths (N, 3), or None.
         :param static: Per-edge mask (E,) of caller-supplied edges to exempt, or None.
+        :param distance_cutoff: Radius the edges were built at for this call, or None for the
+            constructed one. The taper has to reach zero exactly where the graph ends, so this is
+            the same value :meth:`build_neighborhood` was given.
         :return: Envelope weights (E, 1), or None when no envelope is configured."""
 
         if self.envelope_cutoff is None:
             return None
 
+        cutoff = self.envelope_cutoff if distance_cutoff is None else distance_cutoff
+        if cutoff <= 0:
+            raise ValueError(
+                "the envelope tapers edges at `distance_cutoff`, so it needs one; got "
+                f"distance_cutoff={cutoff}."
+            )
+
         src, dst = edge_index[0], edge_index[1]
         rel_x = minimum_image(x[dst] - x[src], box[dst] if box is not None else None)
         dist = squared_distance(rel_x).clamp(min=1e-8).sqrt()
-        env = polynomial_envelope(dist, self.envelope_cutoff, self.envelope_exponent)
+        env = polynomial_envelope(dist, cutoff, self.envelope_exponent)
 
         # a static edge set is position-independent, so no edge enters or leaves at the cutoff and
         # there is nothing to taper; tapering it would silently delete every static edge longer
@@ -587,6 +610,7 @@ class GeometricEGNN(nn.Module):
         edge_index: Tensor | None = None,
         batch: Tensor | None = None,
         box: Tensor | None = None,
+        distance_cutoff: float | None = None,
     ) -> Tensor:
         """The sparsity pattern of the position Jacobian, as an edge index.
 
@@ -600,6 +624,9 @@ class GeometricEGNN(nn.Module):
         :param edge_index: Static edge connectivity (2, E), or None.
         :param batch: Graph membership (N,), or None for a single graph.
         :param box: Per-node box lengths (N, 3), or None.
+        :param distance_cutoff: Radius of the dynamic graph for this call, overriding the
+            constructed one; None uses it. A wider radius costs more colours, which is
+            what makes pricing one worth doing before running at it.
         :return: Edge index (2, E') of the pattern, carrying every self-loop."""
 
         # edge_dim=0: the pattern is set by which edges exist, never by what they carry, and
@@ -611,7 +638,9 @@ class GeometricEGNN(nn.Module):
             batch,
             box,
             edge_dim=0,
-            distance_cutoff=self.distance_cutoff,
+            distance_cutoff=(
+                self.distance_cutoff if distance_cutoff is None else distance_cutoff
+            ),
             num_nearest_neighbors=self.num_nearest_neighbors,
         )
 
@@ -623,6 +652,7 @@ class GeometricEGNN(nn.Module):
         edge_index: Tensor | None = None,
         batch: Tensor | None = None,
         box: Tensor | None = None,
+        distance_cutoff: float | None = None,
     ) -> Tensor:
         """Group the nodes so one derivative pass reads every diagonal block of a group at once.
 
@@ -630,9 +660,11 @@ class GeometricEGNN(nn.Module):
         :param edge_index: Static edge connectivity (2, E), or None.
         :param batch: Graph membership (N,), or None for a single graph.
         :param box: Per-node box lengths (N, 3), or None.
+        :param distance_cutoff: Radius of the dynamic graph for this call, overriding the
+            constructed one; None uses it. A wider radius costs more colours.
         :return: Colours (N,), numbered contiguously from zero."""
 
-        pattern = self.sparsity_pattern(x, edge_index, batch, box)
+        pattern = self.sparsity_pattern(x, edge_index, batch, box, distance_cutoff)
 
         return greedy_colouring(pattern, x.shape[0])
 
@@ -645,6 +677,7 @@ class GeometricEGNN(nn.Module):
         batch: Tensor | None = None,
         box: Tensor | None = None,
         create_graph: bool = False,
+        distance_cutoff: float | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Run the stack and take the exact divergence of its displacement field.
 
@@ -667,11 +700,16 @@ class GeometricEGNN(nn.Module):
         :param box: Per-node box lengths (N, 3), or None.
         :param create_graph: Whether to build the second-order graph so the divergence itself is
             differentiable. Leave False unless backpropagating through it.
+        :param distance_cutoff: Radius of the dynamic graph for this call, overriding the
+            constructed one; None uses it. The envelope tapers at the same radius, so the field
+            stays C^1 where an edge enters or leaves. The encoding length scale ``cutoff`` is
+            unaffected -- a radius past it aliases long edges onto short-range basis values.
+            The colouring is taken from the edges this radius produced, so it follows too.
         :return: Updated features (N, dim), positions (N, 3), and one divergence per graph
             (num_graphs,)."""
 
         edge_index, h_edge, static = self.build_neighborhood(
-            x, edge_index, h_edge, batch, box
+            x, edge_index, h_edge, batch, box, distance_cutoff
         )
         colours = greedy_colouring(
             composed_closure(self.layer_adjacencies(edge_index, static), x.shape[0]),
@@ -690,7 +728,7 @@ class GeometricEGNN(nn.Module):
                 edge_index,
                 h_edge,
                 box,
-                self.edge_envelope(x, edge_index, box, static),
+                self.edge_envelope(x, edge_index, box, static, distance_cutoff),
                 static,
             )
             displacement = x_out - x

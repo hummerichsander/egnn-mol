@@ -98,6 +98,7 @@ class RadialField(nn.Module):
         h_edge: Tensor | None = None,
         batch: Tensor | None = None,
         box: Tensor | None = None,
+        distance_cutoff: float | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Evaluate the velocity and its exact divergence on a packed graph.
 
@@ -111,7 +112,16 @@ class RadialField(nn.Module):
         :param h_edge: Static edge features (E, edge_dim), or None.
         :param batch: Graph membership (N,), or None for a single graph.
         :param box: Per-node box lengths (N, 3), or None.
+        :param distance_cutoff: Radius of the dynamic graph for this call, overriding the
+            constructed one; None uses it. The envelope and its derivative taper at the same
+            radius, so the closed form keeps matching the field. There is no separate envelope
+            flag here, so ``0.0`` drops the radius graph and its taper together, leaving the
+            static edges. The encoding length scale ``cutoff`` is unaffected -- a radius past it
+            aliases long edges onto short-range basis values.
         :return: Velocity (N, 3) and one divergence per graph (num_graphs,)."""
+
+        # named `radius`, not `cutoff`: `self.cutoff` two lines below is the encoding scale.
+        radius = self.distance_cutoff if distance_cutoff is None else distance_cutoff
 
         edge_index, h_edge, static = build_edges(
             x,
@@ -120,7 +130,7 @@ class RadialField(nn.Module):
             batch,
             box,
             edge_dim=self.edge_dim,
-            distance_cutoff=self.distance_cutoff,
+            distance_cutoff=radius,
             num_nearest_neighbors=self.num_nearest_neighbors,
         )
         src, dst = edge_index[0], edge_index[1]
@@ -132,13 +142,9 @@ class RadialField(nn.Module):
         db = encode_distance_derivative(
             dist, self.encoding, self.encoding_features, self.cutoff
         )
-        if self.distance_cutoff > 0:
-            env = polynomial_envelope(
-                dist, self.distance_cutoff, self.envelope_exponent
-            )
-            d_env = polynomial_envelope_derivative(
-                dist, self.distance_cutoff, self.envelope_exponent
-            )
+        if radius > 0:
+            env = polynomial_envelope(dist, radius, self.envelope_exponent)
+            d_env = polynomial_envelope_derivative(dist, radius, self.envelope_exponent)
             # a static edge never enters or leaves at the cutoff, so it needs no taper; d_env must
             # go to zero with it or the closed-form derivative stops matching the field.
             env = torch.where(static[:, None], torch.ones_like(env), env)

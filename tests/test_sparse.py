@@ -207,3 +207,101 @@ def test_cross_backbone_agreement_with_deep_mlps():
 
     assert torch.allclose(x_d[0], x_s, atol=1e-5)
     assert torch.allclose(h_node_d[0], h_node_s, atol=1e-5)
+
+
+def randomized(net, seed: int = 0):
+    """Overwrite the near-identity init, which otherwise leaves every variant equal to ``x``.
+
+    :param net: The module to overwrite in place.
+    :param seed: Seed of the weight draw.
+    :return: The same module, in eval mode."""
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for p in net.parameters():
+            p.copy_(0.1 * torch.randn(p.shape, generator=g))
+    return net.eval()
+
+
+def test_per_call_cutoff_matches_a_net_built_at_that_radius():
+    """A per-call radius must reproduce the net that was constructed with it, weights aside.
+
+    The definitive statement of the feature: the override changes the neighborhood and nothing
+    else, so it cannot be distinguished from having built the net that way."""
+    torch.manual_seed(4)
+    n, dim = 9, 8
+    x = torch.rand(n, 3) * 4.0
+    h_node = torch.randn(n, dim)
+
+    common = dict(depth=2, dim=dim, m_dim=8, envelope=True)
+    built_at_1 = randomized(GeometricEGNN(**common, distance_cutoff=1.0))
+    built_at_3 = GeometricEGNN(**common, distance_cutoff=3.0).eval()
+    built_at_3.load_state_dict(built_at_1.state_dict())
+
+    with torch.no_grad():
+        overridden = built_at_1(h_node, x, distance_cutoff=3.0)
+        constructed = built_at_3(h_node, x)
+        unchanged = built_at_1(h_node, x)
+
+    assert torch.allclose(overridden[0], constructed[0])
+    assert torch.allclose(overridden[1], constructed[1])
+    # the two radii must actually disagree, or the test above passes vacuously.
+    assert not torch.allclose(overridden[1], unchanged[1])
+
+
+def test_per_call_cutoff_matches_a_field_built_at_that_radius():
+    """The same claim for ``RadialField``, whose envelope derivative must move with the radius too."""
+    from egnn_mol import RadialField
+
+    torch.manual_seed(5)
+    n, dim = 9, 8
+    x = torch.rand(n, 3) * 4.0
+    h_node = torch.randn(n, dim)
+
+    common = dict(dim=dim, encoding="gaussian", encoding_features=6, cutoff=3.0, m_dim=8)
+    built_at_1 = randomized(RadialField(**common, distance_cutoff=1.0))
+    built_at_3 = RadialField(**common, distance_cutoff=3.0).eval()
+    built_at_3.load_state_dict(built_at_1.state_dict())
+
+    with torch.no_grad():
+        v, div = built_at_1(h_node, x, distance_cutoff=3.0)
+        v_ref, div_ref = built_at_3(h_node, x)
+        v_unchanged, _ = built_at_1(h_node, x)
+
+    assert torch.allclose(v, v_ref)
+    assert torch.allclose(div, div_ref)
+    assert not torch.allclose(v, v_unchanged)
+
+
+@pytest.mark.parametrize("periodic", [False, True])
+@pytest.mark.parametrize("tripp", [0, 2])
+def test_cross_backbone_agreement_under_a_per_call_cutoff(periodic, tripp):
+    """Dense and sparse must agree on what an overridden radius *means*, not just on the default.
+
+    They build their neighborhoods by entirely different code paths -- a padded (B, N, K) gather
+    against ``torch_cluster`` -- so agreement here is the sharpest check that the override lands
+    in the same place on both."""
+    torch.manual_seed(2)
+    n, dim = 7, 8
+    x = torch.rand(n, 3) * 4.0
+    h_node = torch.randn(n, dim)
+    box_row = torch.tensor([4.0, 4.5, 3.5])
+
+    common = dict(
+        depth=2, dim=dim, m_dim=8, tripp_num_layers=tripp, distance_cutoff=1.0, envelope=True
+    )
+    dense = randomized(EGNN(**common))
+    sparse = GeometricEGNN(**common).eval()
+    for dl, sl in zip(dense.layers, sparse.layers):
+        sl.core.load_state_dict(dl.core.state_dict())
+
+    dense_box = box_row[None] if periodic else None
+    sparse_box = box_row.expand(n, 3) if periodic else None
+
+    with torch.no_grad():
+        h_d, x_d = dense(h_node[None], x[None], box=dense_box, distance_cutoff=2.5)
+        h_s, x_s = sparse(h_node, x, box=sparse_box, distance_cutoff=2.5)
+        _, x_default = sparse(h_node, x, box=sparse_box)
+
+    assert torch.allclose(x_d[0], x_s, atol=1e-5)
+    assert torch.allclose(h_d[0], h_s, atol=1e-5)
+    assert not torch.allclose(x_s, x_default, atol=1e-5)

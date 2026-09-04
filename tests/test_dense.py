@@ -97,3 +97,75 @@ def test_empty_schedule_drops_the_radius_graph(system):
 def test_schedule_rejects_a_layer_that_does_not_exist():
     with pytest.raises(ValueError, match="dynamic_layers"):
         EGNN(depth=2, dim=8, m_dim=8, dynamic_layers=(2,))
+
+
+def randomized(net: EGNN, seed: int = 0) -> EGNN:
+    """Overwrite the near-identity init, which otherwise leaves every variant equal to ``x``.
+
+    :param net: The net to overwrite in place.
+    :param seed: Seed of the weight draw.
+    :return: The same net, in eval mode."""
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for p in net.parameters():
+            p.copy_(0.1 * torch.randn(p.shape, generator=g))
+    return net.eval()
+
+
+def test_per_call_cutoff_matches_a_net_built_at_that_radius(system):
+    """A per-call radius must reproduce the net that was constructed with it, weights aside.
+
+    The definitive statement of the feature: the override changes the neighborhood and nothing
+    else, so it cannot be distinguished from having built the net that way."""
+    h_node, x, box = system
+    common = dict(depth=2, dim=8, m_dim=8, envelope=True)
+    built_at_2 = randomized(EGNN(**common, distance_cutoff=2.0))
+    built_at_5 = EGNN(**common, distance_cutoff=5.0).eval()
+    built_at_5.load_state_dict(built_at_2.state_dict())
+
+    with torch.no_grad():
+        overridden = built_at_2(h_node, x, box=box, distance_cutoff=5.0)
+        constructed = built_at_5(h_node, x, box=box)
+        unchanged = built_at_2(h_node, x, box=box)
+
+    assert torch.allclose(overridden[0], constructed[0])
+    assert torch.allclose(overridden[1], constructed[1])
+    # the two radii must actually disagree, or the test above passes vacuously.
+    assert not torch.allclose(overridden[1], unchanged[1])
+
+
+def test_per_call_cutoff_builds_a_graph_where_there_was_none(system):
+    """A net with no dynamic graph at all falls back to all-pairs, so the override must be read
+    by the guard that decides whether to build a neighborhood -- not only by the builder."""
+    h_node, x, box = system
+    all_pairs = randomized(EGNN(depth=2, dim=8, m_dim=8))
+    radius = EGNN(depth=2, dim=8, m_dim=8, distance_cutoff=2.0).eval()
+    radius.load_state_dict(all_pairs.state_dict())
+
+    with torch.no_grad():
+        overridden = all_pairs(h_node, x, box=box, distance_cutoff=2.0)[1]
+        assert torch.allclose(overridden, radius(h_node, x, box=box)[1])
+        assert not torch.allclose(overridden, all_pairs(h_node, x, box=box)[1])
+
+
+def test_per_call_cutoff_moves_the_envelope_with_it(system):
+    """The taper has to reach zero where the graph ends, or an edge re-enters with finite weight.
+
+    Read off ``edge_envelope`` directly, which is weight-independent and so states the claim
+    without the network in the way."""
+    _, x, box = system
+    common = dict(depth=2, dim=8, m_dim=8, envelope=True)
+    net = EGNN(**common, distance_cutoff=4.0).eval()
+    reference = EGNN(**common, distance_cutoff=5.0).eval()
+
+    tapered_at_5 = net.edge_envelope(x, box, None, None, 5.0)
+    assert torch.allclose(tapered_at_5, reference.edge_envelope(x, box, None, None))
+    assert not torch.allclose(tapered_at_5, net.edge_envelope(x, box, None, None))
+
+
+def test_a_per_call_zero_radius_still_needs_a_radius_to_taper_at(system):
+    """The envelope is meaningless at a zero radius, exactly as it is at construction."""
+    h_node, x, box = system
+    net = EGNN(depth=2, dim=8, m_dim=8, distance_cutoff=4.0, envelope=True).eval()
+    with pytest.raises(ValueError, match="distance_cutoff"):
+        net(h_node, x, box=box, distance_cutoff=0.0)

@@ -370,6 +370,7 @@ class EGNN(nn.Module):
         mask: Tensor | None = None,
         box: Tensor | None = None,
         return_x_changes: bool = False,
+        distance_cutoff: float | None = None,
     ):
         """Run all message-passing layers.
 
@@ -380,28 +381,33 @@ class EGNN(nn.Module):
         :param mask: Node validity mask (B, N), or None.
         :param box: Periodic box lengths (B, 3), or None.
         :param return_x_changes: If True, also return the position trajectory.
+        :param distance_cutoff: Radius of the dynamic graph for this call, overriding the
+            constructed one; None uses it. The envelope tapers at the same radius, so the field
+            stays C^1 where an edge enters or leaves. The encoding length scale ``cutoff`` is
+            unaffected -- a radius past it aliases long edges onto short-range basis values.
         :return: ``(h_node, x)`` or ``(h_node, x, x_changes)``."""
+
+        # named `radius`, not `cutoff`: the layers' `cutoff` is the encoding scale.
+        radius = self.distance_cutoff if distance_cutoff is None else distance_cutoff
 
         nbhd_indices: Tensor | None = None
         nbhd_mask: Tensor | None = None
         nbhd_static: Tensor | None = None
-        if (
-            adj_mat is not None
-            or self.distance_cutoff > 0
-            or self.num_nearest_neighbors > 0
-        ):
+        # `radius`, not `self.distance_cutoff`: a net built without a radius graph must still
+        # build one when a call asks for it, or it silently stays all-pairs.
+        if adj_mat is not None or radius > 0 or self.num_nearest_neighbors > 0:
             nbhd_indices, nbhd_mask, nbhd_static = build_neighborhood(
                 x,
                 box,
                 adj_mat,
                 mask,
-                self.distance_cutoff,
+                radius,
                 self.num_nearest_neighbors,
             )
             if h_edge is not None:
                 h_edge = batched_index_select(h_edge, nbhd_indices, dim=2)
 
-        env = self.edge_envelope(x, box, nbhd_indices, nbhd_static)
+        env = self.edge_envelope(x, box, nbhd_indices, nbhd_static, distance_cutoff)
 
         # a static-only layer drops the dynamic entries by masking them out of the aggregation;
         # the envelope is already one on the static ones, so it needs no slice of its own.
@@ -443,6 +449,7 @@ class EGNN(nn.Module):
         box: Tensor | None,
         nbhd_indices: Tensor | None,
         nbhd_static: Tensor | None = None,
+        distance_cutoff: float | None = None,
     ) -> Tensor | None:
         """The cutoff envelope of every edge, evaluated on the positions the edges were built from.
 
@@ -456,10 +463,20 @@ class EGNN(nn.Module):
         :param box: Periodic box lengths (B, 3), or None.
         :param nbhd_indices: Neighbor indices (B, N, K), or None for all-pairs.
         :param nbhd_static: Mask (B, N, K) of static edges to exempt from the taper, or None.
+        :param distance_cutoff: Radius the neighborhood was built at for this call, or None for
+            the constructed one. The taper has to reach zero exactly where the graph ends, so
+            this is the same value :func:`build_neighborhood` was given.
         :return: Envelope weights (B, N, K, 1) or (B, N, N, 1), or None when none is configured."""
 
         if self.envelope_cutoff is None:
             return None
+
+        cutoff = self.envelope_cutoff if distance_cutoff is None else distance_cutoff
+        if cutoff <= 0:
+            raise ValueError(
+                "the envelope tapers edges at `distance_cutoff`, so it needs one; got "
+                f"distance_cutoff={cutoff}."
+            )
 
         box_pairs = _box_for_pairs(box)
         if nbhd_indices is not None:
@@ -471,7 +488,7 @@ class EGNN(nn.Module):
                 box_pairs,
             )
         dist = squared_distance(rel_x).clamp(min=1e-8).sqrt()
-        env = polynomial_envelope(dist, self.envelope_cutoff, self.envelope_exponent)
+        env = polynomial_envelope(dist, cutoff, self.envelope_exponent)
 
         # a static edge set is position-independent, so no edge enters or leaves at the cutoff and
         # there is nothing to taper; see the sparse backbone's `edge_envelope`.

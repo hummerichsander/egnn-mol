@@ -641,3 +641,92 @@ class TestLayerSchedule:
         """An index past the stack is a config error, not a silently ignored one."""
         with pytest.raises(ValueError, match="dynamic_layers"):
             GeometricEGNN(depth=2, dim=8, encoding_features=6, dynamic_layers=(2,))
+
+
+class TestPerCallCutoff:
+    """The radius may be given per call; everything derived from the edge set must follow it."""
+
+    @pytest.mark.parametrize("tripp", [0, 2])
+    def test_the_divergence_matches_the_dense_trace(self, chain, tripp):
+        """The colouring must describe the graph the layers ran on, not the constructed one.
+
+        A colouring taken at the smaller radius would leave two same-coloured nodes within reach
+        at the larger one, and the trace would be silently wrong rather than obviously broken.
+
+        :param chain: Path-graph fixture.
+        :param tripp: Depth of the triple-product MLP."""
+        h_node, x = chain
+        net = make_net(depth=2, tripp_num_layers=tripp, envelope=True)
+        wide = 2.0 * CUTOFF
+
+        x_grad = x.clone().requires_grad_(True)
+        reference = autograd_trace(
+            net(h_node, x_grad, distance_cutoff=wide)[1] - x_grad, x_grad
+        )
+
+        _, _, div = net.forward_and_divergence(
+            h_node, x.clone(), distance_cutoff=wide
+        )
+
+        assert torch.allclose(div.squeeze(), reference, rtol=1e-9, atol=1e-9)
+        # the wider graph must actually change the field, or a backbone that dropped the
+        # override entirely would agree with itself here.
+        narrow = net.forward_and_divergence(h_node, x.clone())[2]
+        assert not torch.allclose(div, narrow)
+
+    def test_the_pattern_matches_a_net_built_at_that_radius(self, chain):
+        """``sparsity_pattern`` has its own ``build_edges`` call, so it needs the override too.
+
+        :param chain: Path-graph fixture."""
+        _, x = chain
+        n = x.shape[0]
+        wide = 2.0 * CUTOFF
+        reference = make_net(distance_cutoff=wide)
+
+        pattern = make_net().sparsity_pattern(x, distance_cutoff=wide)
+        expected = reference.sparsity_pattern(x)
+
+        assert torch.equal(pattern, expected)
+        assert int(greedy_colouring(pattern, n).max()) > int(
+            greedy_colouring(make_net().sparsity_pattern(x), n).max()
+        )
+
+    def test_the_field_is_smooth_where_an_edge_appears(self, chain):
+        """The taper must move with the radius, or an edge re-enters with a finite weight.
+
+        Halving the step halves the difference only if the envelope reaches zero exactly at the
+        radius the graph was built at; a taper left at the constructed radius jumps instead.
+
+        :param chain: Path-graph fixture."""
+        torch.manual_seed(0)
+        h_node = torch.randn(3, 8, dtype=torch.float64)
+        net = make_net(depth=2, distance_cutoff=0.5 * CUTOFF, envelope=True)
+
+        def displacement(separation: float) -> Tensor:
+            x = torch.tensor(
+                [[0.0, 0.0, 0.0], [0.7, 0.0, 0.0], [separation, 0.0, 0.0]],
+                dtype=torch.float64,
+            )
+            return net(h_node, x, distance_cutoff=CUTOFF)[1] - x
+
+        jumps = [
+            float(
+                (displacement(CUTOFF + eps) - displacement(CUTOFF - eps))
+                .abs()
+                .max()
+                .detach()
+            )
+            for eps in (1e-4, 1e-5)
+        ]
+
+        assert jumps[0] / jumps[1] == pytest.approx(10.0, rel=0.05)
+
+    def test_still_needs_a_radius_to_taper_at(self, chain):
+        """A per-call zero radius is as meaningless for the envelope as a constructed one.
+
+        :param chain: Path-graph fixture."""
+        h_node, x = chain
+        net = make_net(envelope=True)
+
+        with pytest.raises(ValueError, match="distance_cutoff"):
+            net(h_node, x, distance_cutoff=0.0)
