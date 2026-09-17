@@ -5,12 +5,7 @@ from torch import Tensor
 
 from egnn_mol import EGNN
 from egnn_mol.dense import DenseEGNNLayer
-from conftest import rotation_z
-
-
-def reflection_z() -> Tensor:
-    """Improper (det = -1) reflection through the xy-plane."""
-    return torch.diag(torch.tensor([1.0, 1.0, -1.0]))
+from conftest import reflection_z, rel_err, rotation_z
 
 
 def make_layer(**kwargs) -> DenseEGNNLayer:
@@ -32,11 +27,6 @@ def randomize(net: EGNN, seed: int = 0) -> EGNN:
         for p in net.parameters():
             p.copy_(0.5 * torch.randn(p.shape, generator=g))
     return net
-
-
-def rel_err(a: Tensor, b: Tensor) -> float:
-    """Relative L2 error, robust to the overall magnitude of the velocity field."""
-    return (a - b).norm().item() / b.norm().clamp(min=1e-8).item()
 
 
 def _run_layer(layer, h_node, x, box):

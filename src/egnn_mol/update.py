@@ -45,6 +45,7 @@ class EquivariantUpdate(nn.Module):
         x_weights_clamp_value: float | None = None,
         tripp_num_layers: int = 0,
         mlp_depth: int = 1,
+        vector_channels: int = 0,
     ) -> None:
         """Build the update.
 
@@ -64,7 +65,13 @@ class EquivariantUpdate(nn.Module):
             chirality term (0 keeps the update E(3)-equivariant).
         :param mlp_depth: Number of hidden blocks in the edge, node and position MLPs. It buys
             capacity without widening the receptive field, so it leaves the Jacobian sparsity
-            pattern untouched."""
+            pattern untouched.
+        :param vector_channels: Number of PaiNN-style equivariant vector features per node; 0
+            keeps the plain scalar update. Each channel is a 3-vector that rotates with the
+            system and persists across layers, contracted to rotation-invariant scalars that
+            feed the node update. A layer still reads one hop, so the sparsity pattern is
+            unchanged; the contractions are dot products only, which keeps the update
+            reflection-equivariant like the rest of the E(3) path."""
 
         super().__init__()
         self.encoding = encoding
@@ -72,6 +79,7 @@ class EquivariantUpdate(nn.Module):
         self.cutoff = cutoff
         self.x_weights_clamp_value = x_weights_clamp_value
         self.tripp = tripp_num_layers > 0
+        self.vector_channels = vector_channels
 
         dist_width = encoding_width(encoding, encoding_features)
         edge_input_dim = dim * 2 + dist_width + edge_dim
@@ -89,8 +97,13 @@ class EquivariantUpdate(nn.Module):
         )
 
         self.node_norm = nn.LayerNorm(dim) if norm_h_node else nn.Identity()
+        # the vector channels reach the scalars only as their invariants, two per channel.
         self.node_mlp = MLP(
-            dim + m_dim, dim * 2, dim, num_layers=mlp_depth, dropout=dropout
+            dim + m_dim + 2 * vector_channels,
+            dim * 2,
+            dim,
+            num_layers=mlp_depth,
+            dropout=dropout,
         )
 
         # With the triple-product term the position head also sees the chirality scalar of
@@ -113,11 +126,34 @@ class EquivariantUpdate(nn.Module):
             else None
         )
 
+        if vector_channels:
+            self.vec_message = MLP(
+                m_dim,
+                m_dim * 2,
+                2 * vector_channels,
+                num_layers=mlp_depth,
+                dropout=dropout,
+            )
+            self.vec_mix = nn.Linear(vector_channels, 2 * vector_channels, bias=False)
+            self.vec_gate = MLP(
+                dim + 2 * vector_channels,
+                m_dim * 2,
+                vector_channels,
+                num_layers=mlp_depth,
+                dropout=dropout,
+            )
+        else:
+            self.vec_message = self.vec_mix = self.vec_gate = None
+
         _init_mlp(self.edge_mlp)
         _init_mlp(self.node_mlp)
         _init_x_head(self.x_mlp)
         if self.triple_mlp is not None:
             _init_mlp(self.triple_mlp)
+        if vector_channels:
+            _init_mlp(self.vec_message)
+            _init_mlp(self.vec_gate)
+            nn.init.xavier_uniform_(self.vec_mix.weight, gain=1e-3)
 
     def message(
         self,
@@ -179,12 +215,55 @@ class EquivariantUpdate(nn.Module):
             weight = weight.clamp(min=-c, max=c)
         return weight
 
-    def update_h_node(self, h_node: Tensor, m_pooled: Tensor) -> Tensor:
+    def vector_coefficients(self, m_ij: Tensor) -> tuple[Tensor, Tensor]:
+        """Per-pair scalars weighting a neighbour's vectors and the edge's own direction.
+
+        :param m_ij: Messages (P, m_dim).
+        :return: Weights for the neighbour's vectors and for the direction, each
+            (P, vector_channels)."""
+
+        a_vv, a_vs = self.vec_message(m_ij).chunk(2, dim=-1)
+        return a_vv, a_vs
+
+    def vector_invariants(self, vec: Tensor) -> tuple[Tensor, Tensor]:
+        """Channel-mix the vectors and contract them to rotation-invariant scalars.
+
+        Dot products only: a cross or triple product would be a pseudoscalar and would drop the
+        update from E(3) to SE(3), which is what ``tripp_num_layers`` is for.
+
+        :param vec: Vector features (num_nodes, vector_channels, 3).
+        :return: The mixed vectors (num_nodes, vector_channels, 3) and the invariants
+            (num_nodes, 2 * vector_channels)."""
+
+        mixed = self.vec_mix(vec.transpose(-2, -1)).transpose(-2, -1)
+        u, v = mixed.chunk(2, dim=-2)
+
+        # squared norms, not norms: a norm has no derivative where a channel is exactly zero,
+        # which is where every channel starts, and the divergence needs a C^1 field.
+        return u, torch.cat([(u * v).sum(-1), (v * v).sum(-1)], dim=-1)
+
+    def gate_vec(self, h_node: Tensor, invariants: Tensor) -> Tensor:
+        """Node-local gate on the mixed vectors, the one place the scalars steer them.
+
+        :param h_node: Node features (num_nodes, dim).
+        :param invariants: Vector invariants (num_nodes, 2 * vector_channels).
+        :return: One scalar per node and channel (num_nodes, vector_channels)."""
+
+        return self.vec_gate(torch.cat([h_node, invariants], dim=-1))
+
+    def update_h_node(
+        self, h_node: Tensor, m_pooled: Tensor, invariants: Tensor | None = None
+    ) -> Tensor:
         """Residual node-feature update from already-reduced messages.
 
         :param h_node: Node features (num_nodes, dim).
         :param m_pooled: Reduced messages per node (num_nodes, m_dim).
+        :param invariants: Vector invariants (num_nodes, 2 * vector_channels), or None without
+            vector channels.
         :return: Updated node features (num_nodes, dim)."""
 
-        normed = self.node_norm(h_node)
-        return self.node_mlp(torch.cat([normed, m_pooled], dim=-1)) + h_node
+        parts = [self.node_norm(h_node), m_pooled]
+        if invariants is not None:
+            parts.append(invariants)
+
+        return self.node_mlp(torch.cat(parts, dim=-1)) + h_node

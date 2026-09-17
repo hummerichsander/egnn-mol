@@ -11,7 +11,7 @@ from .geometry import minimum_image, signed_volume, squared_distance
 from .sparsity import composed_closure, greedy_colouring
 from .update import EquivariantUpdate
 
-Aggregation = Literal["sum", "mean"]
+Aggregation = Literal["sum", "mean", "vp"]
 
 
 def radius_graph_pbc(
@@ -201,10 +201,11 @@ class SparseEGNNLayer(nn.Module):
         x_weights_clamp_value: float | None = None,
         tripp_num_layers: int = 0,
         mlp_depth: int = 1,
+        vector_channels: int = 0,
     ) -> None:
         """See :class:`GeometricEGNN` for the shared arguments.
 
-        :param aggr: How to aggregate messages onto nodes (``"sum"`` or ``"mean"``)."""
+        :param aggr: How to aggregate messages onto nodes (``"sum"``, ``"mean"`` or ``"vp"``)."""
 
         super().__init__()
         self.aggr = aggr
@@ -223,6 +224,7 @@ class SparseEGNNLayer(nn.Module):
             x_weights_clamp_value=x_weights_clamp_value,
             tripp_num_layers=tripp_num_layers,
             mlp_depth=mlp_depth,
+            vector_channels=vector_channels,
         )
 
     def forward(
@@ -233,7 +235,8 @@ class SparseEGNNLayer(nn.Module):
         h_edge: Tensor | None = None,
         box: Tensor | None = None,
         env: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+        vec: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
         """Message-passing update on a packed graph.
 
         :param h_node: Node features (N, dim).
@@ -242,7 +245,8 @@ class SparseEGNNLayer(nn.Module):
         :param h_edge: Edge features (E, edge_dim), or None.
         :param box: Per-node box lengths (N, 3), or None.
         :param env: Per-edge cutoff envelope (E, 1), or None for an untapered update.
-        :return: Updated features (N, dim) and positions (N, 3)."""
+        :param vec: Vector features (N, vector_channels, 3), or None without them.
+        :return: Updated features (N, dim), positions (N, 3) and vector features."""
 
         src, dst = edge_index[0], edge_index[1]
         n = x.shape[0]
@@ -274,9 +278,46 @@ class SparseEGNNLayer(nn.Module):
 
         x_out = x + scatter(weight * normed, dst, dim=0, dim_size=n, reduce="sum")
 
-        m_pooled = scatter(m_ij, dst, dim=0, dim_size=n, reduce=self.aggr)
-        h_node_out = self.core.update_h_node(h_node, m_pooled)
-        return h_node_out, x_out
+        invariants, vec_out = None, vec
+        if self.core.vector_channels:
+            # one hop, like the message: the neighbour's *incoming* vectors, plus this edge's own
+            # direction. Reading a neighbour's updated vectors instead would put the layer two
+            # hops out, the way the chirality term does, and `layer_adjacencies` counts one.
+            a_vv, a_vs = self.core.vector_coefficients(m_ij)
+            message = a_vv[..., None] * vec[src] + a_vs[..., None] * normed[:, None, :]
+            vec_out = vec + scatter(message, dst, dim=0, dim_size=n, reduce="sum")
+
+            u, invariants = self.core.vector_invariants(vec_out)
+            vec_out = vec_out + self.core.gate_vec(h_node, invariants)[..., None] * u
+
+        m_pooled = self.pool(m_ij, dst, n, env)
+        h_node_out = self.core.update_h_node(h_node, m_pooled, invariants)
+        return h_node_out, x_out, vec_out
+
+    def pool(self, m_ij: Tensor, dst: Tensor, n: int, env: Tensor | None) -> Tensor:
+        """Reduce the per-edge messages onto their target nodes.
+
+        :param m_ij: Messages (E, m_dim), already tapered by ``env`` if there is one.
+        :param dst: Target node of every edge (E,).
+        :param n: Number of nodes.
+        :param env: Per-edge cutoff envelope (E, 1), or None.
+        :return: Pooled messages (n, m_dim)."""
+
+        if self.aggr != "vp":
+            return scatter(m_ij, dst, dim=0, dim_size=n, reduce=self.aggr)
+
+        # sum / sqrt(degree), so the pooled message keeps a degree-independent scale: plain "sum"
+        # grows its variance with degree and "mean" shrinks it, and `use_residue` puts sparse bond
+        # nodes and dense residue cliques in one graph. The degree counts the envelope, squared,
+        # rather than edges: an integer count would jump as an edge crosses `distance_cutoff`,
+        # reintroducing the discontinuity the envelope exists to remove, and sum(env^2) is also
+        # the variance the taper actually leaves. Offset by one rather than clamped, to stay
+        # smooth and to keep a lone tapered edge tapered instead of rescaling it back to full.
+        weights = torch.ones_like(m_ij[:, :1]) if env is None else env
+        degree = scatter(weights * weights, dst, dim=0, dim_size=n, reduce="sum")
+        total = scatter(m_ij, dst, dim=0, dim_size=n, reduce="sum")
+
+        return total / (1.0 + degree).sqrt()
 
 
 class GeometricEGNN(nn.Module):
@@ -321,7 +362,9 @@ class GeometricEGNN(nn.Module):
             dynamic edges are what make the position Jacobian's sparsity pattern a ball of radius
             ``receptive_hops * distance_cutoff``, so restricting them to a few layers decouples
             the depth of the stack from the radius of that ball.
-        :param aggr: Message aggregation onto nodes ("sum" or "mean").
+        :param aggr: Message aggregation onto nodes. "sum" and "mean" are the plain reductions;
+            "vp" is variance-preserving, dividing the sum by the square root of the
+            envelope-weighted degree so the pooled message's scale does not track node degree.
         :param envelope: Taper every edge's contribution to zero at ``distance_cutoff``, so the
             field stays C^1 where an edge enters or leaves the radius graph. Off by default: a
             network trained without it computes a different function, so turning it on silently
@@ -514,10 +557,17 @@ class GeometricEGNN(nn.Module):
             ``dynamic_layers``; without it every layer reads the full edge set.
         :return: Updated features (N, dim) and positions (N, 3)."""
 
+        # the vector channels are internal state of one pass: they start at zero, carry the
+        # directional part between layers, and are read out as invariants rather than returned.
+        channels = self.layers[0].core.vector_channels
+        vec = x.new_zeros(x.shape[0], channels, 3) if channels else None
+
         for layer, (edges, features, envelope) in zip(
             self.layers, self.layer_edges(edge_index, h_edge, env, static)
         ):
-            h_node, x = layer(h_node, x, edges, features, box=box, env=envelope)
+            h_node, x, vec = layer(
+                h_node, x, edges, features, box=box, env=envelope, vec=vec
+            )
 
         return h_node, x
 

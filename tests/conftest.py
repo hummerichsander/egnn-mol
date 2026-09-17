@@ -11,6 +11,16 @@ def rotation_z(theta: float) -> Tensor:
     return torch.tensor([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
+def reflection_z() -> Tensor:
+    """Improper (det = -1) reflection through the xy-plane."""
+    return torch.diag(torch.tensor([1.0, 1.0, -1.0]))
+
+
+def rel_err(a: Tensor, b: Tensor) -> float:
+    """Relative L2 error, robust to the overall magnitude of the velocity field."""
+    return (a - b).norm().item() / b.norm().clamp(min=1e-8).item()
+
+
 @pytest.fixture
 def system() -> tuple[Tensor, Tensor, Tensor]:
     """Two batches with non-cubic cells and atoms placed in the interior.
