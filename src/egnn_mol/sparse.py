@@ -202,6 +202,7 @@ class SparseEGNNLayer(nn.Module):
         tripp_num_layers: int = 0,
         mlp_depth: int = 1,
         vector_channels: int = 0,
+        vector_chirality: bool = False,
     ) -> None:
         """See :class:`GeometricEGNN` for the shared arguments.
 
@@ -225,6 +226,7 @@ class SparseEGNNLayer(nn.Module):
             tripp_num_layers=tripp_num_layers,
             mlp_depth=mlp_depth,
             vector_channels=vector_channels,
+            vector_chirality=vector_chirality,
         )
 
     def forward(
@@ -262,6 +264,7 @@ class SparseEGNNLayer(nn.Module):
         if env is not None:
             normed, m_ij = env * normed, env * m_ij
 
+        chis = []
         if self.core.tripp:
             abc = self.core.triple_abc(m_ij)  # (E, 3)
             v = torch.stack(
@@ -271,7 +274,13 @@ class SparseEGNNLayer(nn.Module):
                 ],
                 dim=1,
             )  # (N, 3=k, 3=xyz)
-            chi = signed_volume(v[:, 0], v[:, 1], v[:, 2])  # (N, 1)
+            chis.append(signed_volume(v[:, 0], v[:, 1], v[:, 2]))  # (N, 1)
+        if self.core.vector_chirality:
+            # off the vectors this layer was handed, so it adds no hop of its own.
+            chis.append(self.core.vector_chirality_scalar(vec))
+
+        if chis:
+            chi = torch.cat(chis, dim=-1)
             weight = self.core.x_weight(m_ij, chi[dst], chi[src])
         else:
             weight = self.core.x_weight(m_ij)
@@ -616,8 +625,11 @@ class GeometricEGNN(nn.Module):
     def layer_adjacencies(self, edge_index: Tensor, static: Tensor) -> list[Tensor]:
         """One edge index per hop of the stack, in order, for the composed sparsity pattern.
 
-        A layer reads one hop of its own edge set, or two with the SE(3) chirality term -- see
-        :attr:`receptive_hops` for that recursion. A layer outside ``dynamic_layers`` therefore
+        A layer reads one hop of its own edge set, or two with the triple-product chirality term
+        -- see :attr:`receptive_hops` for that recursion. ``vector_chirality`` is chirality of the
+        other kind and stays at one: it contracts vectors the layer was handed rather than ones it
+        aggregates, so its pseudoscalar sits at the same generation as ``h_j``, which the message
+        already reads. A layer outside ``dynamic_layers`` therefore
         contributes hops of the static graph rather than of the full neighborhood, which is what
         keeps the composed ball small while the stack stays deep.
 
@@ -639,8 +651,11 @@ class GeometricEGNN(nn.Module):
         """Graph distance over which one position update can reach, across the whole stack.
 
         A layer's feature update reads one hop. Its position update reads one hop too, unless
-        the SE(3) chirality term is on: ``x_weight`` then also sees ``chi`` at both endpoints,
-        and ``chi`` is itself a one-hop aggregate, which puts the position update two hops out.
+        the triple-product chirality term is on: ``x_weight`` then also sees ``chi`` at both
+        endpoints, and that ``chi`` is itself a one-hop aggregate, which puts the position update
+        two hops out. ``vector_chirality`` feeds the same head a pseudoscalar without that cost,
+        because the vectors it contracts were aggregated by earlier layers: reading a neighbour's
+        *incoming* state is one hop, the same one ``m_ij`` already pays for ``h_j``.
         Writing the two radii as ``a_l`` (positions) and ``b_l`` (features), the recursion is
         ``a_l = max(a, b)_{l-1} + (2 if tripp else 1)`` and ``b_l = max(a, b)_{l-1} + 1``, so
         after ``depth`` layers the positions reach ``2 * depth`` hops with the chirality term

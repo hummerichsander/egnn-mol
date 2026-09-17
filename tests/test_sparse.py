@@ -434,3 +434,52 @@ def test_vector_channels_change_the_field(compact_system):
         )
 
     assert not torch.allclose(plain - x, vector - x, atol=1e-5)
+
+
+def test_vector_chirality_is_parity_odd_but_costs_no_hop(compact_system):
+    """The pseudoscalar off the vector channels breaks reflection, and only reflection.
+
+    That is the point of it: chirality awareness with the receptive field of the plain E(3)
+    stack, because it contracts vectors the layer was handed rather than ones it aggregates.
+    Rotations stay symmetries; `receptive_hops` stays at `depth`, where `tripp_num_layers`
+    doubles it.
+    """
+    h_node, x, _ = compact_system
+    h_node, x = h_node[0], x[0]
+    edge_index = full_edge_index(torch.arange(x.shape[0]), include_self=False)
+    net = randomized(
+        GeometricEGNN(
+            depth=2,
+            dim=8,
+            m_dim=8,
+            norm_displacement=True,
+            vector_channels=4,
+            vector_chirality=True,
+        ),
+        scale=0.5,
+    )
+
+    def run(positions):
+        with torch.no_grad():
+            _, x_out = net(h_node, positions, edge_index=edge_index)
+        return x_out - positions
+
+    centroid = x.mean(0, keepdim=True)
+    v_ref = run(x)
+
+    R = rotation_z(math.pi / 5)
+    assert rel_err(run((x - centroid) @ R.T + centroid), v_ref @ R.T) < 1e-5
+
+    # the break measures 8.5e-3 to 2.7 over the first five seeds, against a rotation residual of
+    # ~1e-6, so the floor sits an order under the weakest draw rather than at the dense SE(3)
+    # test's 1e-2, which seed 0 would slip past.
+    M = reflection_z()
+    assert rel_err(run((x - centroid) @ M.T + centroid), v_ref @ M.T) > 1e-3
+
+    assert net.receptive_hops == 2  # depth, not 2 * depth
+
+
+def test_vector_chirality_needs_vector_channels():
+    """Contracting channels that do not exist is a configuration error, not a silent no-op."""
+    with pytest.raises(ValueError, match="vector_channels"):
+        GeometricEGNN(depth=1, dim=8, m_dim=8, vector_chirality=True)

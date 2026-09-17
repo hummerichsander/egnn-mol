@@ -2,6 +2,7 @@ import torch
 from torch import Tensor, nn
 
 from .encodings import Encoding, encode_distance, encoding_width
+from .geometry import signed_volume
 from .nn import MLP, DisplacementNorm
 
 
@@ -46,6 +47,7 @@ class EquivariantUpdate(nn.Module):
         tripp_num_layers: int = 0,
         mlp_depth: int = 1,
         vector_channels: int = 0,
+        vector_chirality: bool = False,
     ) -> None:
         """Build the update.
 
@@ -71,7 +73,13 @@ class EquivariantUpdate(nn.Module):
             system and persists across layers, contracted to rotation-invariant scalars that
             feed the node update. A layer still reads one hop, so the sparsity pattern is
             unchanged; the contractions are dot products only, which keeps the update
-            reflection-equivariant like the rest of the E(3) path."""
+            reflection-equivariant like the rest of the E(3) path.
+        :param vector_chirality: Read a pseudoscalar off the vector channels and feed it to the
+            position head, making the update chirality-aware. Like ``tripp_num_layers`` this drops
+            the symmetry from E(3) to SE(3), but it costs no extra hop: the vectors it contracts
+            were aggregated by earlier layers, so it reads state that already exists at layer
+            entry rather than rebuilding it from a fresh one-hop aggregate. Needs
+            ``vector_channels``."""
 
         super().__init__()
         self.encoding = encoding
@@ -80,6 +88,13 @@ class EquivariantUpdate(nn.Module):
         self.x_weights_clamp_value = x_weights_clamp_value
         self.tripp = tripp_num_layers > 0
         self.vector_channels = vector_channels
+        self.vector_chirality = vector_chirality
+
+        if vector_chirality and not vector_channels:
+            raise ValueError(
+                "`vector_chirality` contracts the vector channels, so it needs some; got "
+                f"vector_channels={vector_channels}."
+            )
 
         dist_width = encoding_width(encoding, encoding_features)
         edge_input_dim = dim * 2 + dist_width + edge_dim
@@ -106,10 +121,10 @@ class EquivariantUpdate(nn.Module):
             dropout=dropout,
         )
 
-        # With the triple-product term the position head also sees the chirality scalar of
-        # both endpoints, so its input widens by 2.
+        # Each chirality source shows the position head its pseudoscalar at both endpoints, so
+        # each widens the input by 2.
         self.x_mlp = MLP(
-            m_dim + (2 if self.tripp else 0),
+            m_dim + 2 * (int(self.tripp) + int(vector_chirality)),
             m_dim * 4,
             1,
             num_layers=mlp_depth,
@@ -142,8 +157,14 @@ class EquivariantUpdate(nn.Module):
                 num_layers=mlp_depth,
                 dropout=dropout,
             )
+            # three vectors out of the channels, whose signed volume is the pseudoscalar --
+            # the same shape as the triple-product term, from persistent state instead.
+            self.vec_chirality = (
+                nn.Linear(vector_channels, 3, bias=False) if vector_chirality else None
+            )
         else:
             self.vec_message = self.vec_mix = self.vec_gate = None
+            self.vec_chirality = None
 
         _init_mlp(self.edge_mlp)
         _init_mlp(self.node_mlp)
@@ -154,6 +175,8 @@ class EquivariantUpdate(nn.Module):
             _init_mlp(self.vec_message)
             _init_mlp(self.vec_gate)
             nn.init.xavier_uniform_(self.vec_mix.weight, gain=1e-3)
+        if self.vec_chirality is not None:
+            nn.init.xavier_uniform_(self.vec_chirality.weight, gain=1e-3)
 
     def message(
         self,
@@ -204,11 +227,13 @@ class EquivariantUpdate(nn.Module):
         appended to the message before the position head.
 
         :param m_ij: Messages (P, m_dim).
-        :param chi_i: Chirality scalar of the target node, gathered per pair (P, 1); only with SE(3).
-        :param chi_j: Chirality scalar of the source node, gathered per pair (P, 1); only with SE(3).
+        :param chi_i: Chirality scalars of the target node, gathered per pair (P, c); only with
+            SE(3), and carrying one column per active chirality source.
+        :param chi_j: Chirality scalars of the source node, gathered per pair (P, c); only with
+            SE(3).
         :return: Position weights (P, 1)."""
 
-        inp = torch.cat([m_ij, chi_i, chi_j], dim=-1) if self.tripp else m_ij
+        inp = m_ij if chi_i is None else torch.cat([m_ij, chi_i, chi_j], dim=-1)
         weight = self.x_mlp(inp)
         if self.x_weights_clamp_value is not None:
             c = self.x_weights_clamp_value
@@ -241,6 +266,20 @@ class EquivariantUpdate(nn.Module):
         # squared norms, not norms: a norm has no derivative where a channel is exactly zero,
         # which is where every channel starts, and the divergence needs a C^1 field.
         return u, torch.cat([(u * v).sum(-1), (v * v).sum(-1)], dim=-1)
+
+    def vector_chirality_scalar(self, vec: Tensor) -> Tensor:
+        """Contract the vector channels into one pseudoscalar per node.
+
+        Project the channels onto three vectors and take their signed volume. It is read off the
+        channels a layer is *given*, not ones it has just aggregated, which is what keeps the
+        position update one hop away and the sparsity pattern unchanged.
+
+        :param vec: Vector features (num_nodes, vector_channels, 3).
+        :return: One pseudoscalar per node (num_nodes, 1)."""
+
+        v = self.vec_chirality(vec.transpose(-2, -1)).transpose(-2, -1)
+
+        return signed_volume(v[:, 0], v[:, 1], v[:, 2])
 
     def gate_vec(self, h_node: Tensor, invariants: Tensor) -> Tensor:
         """Node-local gate on the mixed vectors, the one place the scalars steer them.
