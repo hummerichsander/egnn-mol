@@ -79,7 +79,10 @@ class EquivariantUpdate(nn.Module):
             the symmetry from E(3) to SE(3), but it costs no extra hop: the vectors it contracts
             were aggregated by earlier layers, so it reads state that already exists at layer
             entry rather than rebuilding it from a fresh one-hop aggregate. Needs
-            ``vector_channels``."""
+            ``vector_channels``. That provenance also means the first layer contributes nothing:
+            the channels enter it at zero, so the pseudoscalar is identically zero there and a
+            depth-1 stack stays E(3) however this is set. ``tripp_num_layers`` builds its vectors
+            in the layer and acts from the first one, which is the trade for the extra hop."""
 
         super().__init__()
         self.encoding = encoding
