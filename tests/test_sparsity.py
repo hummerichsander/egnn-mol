@@ -15,6 +15,15 @@ from egnn_mol import (
 CUTOFF = 1.5
 
 
+# off, the channel alone, and the channel with the pseudoscalar that reads it -- the last is the
+# one that could widen the Jacobian without widening the pattern.
+VECTOR_VARIANTS = [
+    {},
+    {"vector_channels": 4},
+    {"vector_channels": 4, "vector_chirality": True},
+]
+
+
 def make_net(seed: int = 0, **kwargs) -> GeometricEGNN:
     """A double-precision backbone with non-trivial weights (the near-identity init hides everything).
 
@@ -234,14 +243,21 @@ class TestReceptiveField:
         :param hops: Expected receptive radius."""
         assert make_net(depth=depth, tripp_num_layers=tripp).receptive_hops == hops
 
+    @pytest.mark.parametrize("vector", VECTOR_VARIANTS)
     @pytest.mark.parametrize("tripp", [0, 2])
-    def test_the_jacobian_lives_inside_the_pattern(self, chain, tripp):
+    def test_the_jacobian_lives_inside_the_pattern(self, chain, tripp, vector):
         """Nothing outside the closure may be nonzero, or a colouring of it would be invalid.
 
+        The vector channels are the interesting case: they carry state between layers, so if one
+        ever reached a position update through a neighbour's *freshly aggregated* vectors the
+        true Jacobian would outgrow a pattern that still counts one hop, and the compressed
+        divergence would be wrong while costing exactly what it does now.
+
         :param chain: Path-graph fixture.
-        :param tripp: Depth of the triple-product MLP."""
+        :param tripp: Depth of the triple-product MLP.
+        :param vector: Vector-channel configuration."""
         h_node, x = chain
-        net = make_net(depth=2, tripp_num_layers=tripp)
+        net = make_net(depth=2, tripp_num_layers=tripp, **vector)
 
         x = x.clone().requires_grad_(True)
         support = block_support(net(h_node, x)[1] - x, x)
@@ -308,24 +324,27 @@ class TestMlpDepth:
 class TestColouredDivergence:
     """The compressed divergence against a coordinate-at-a-time trace of the same field."""
 
+    @pytest.mark.parametrize("vector", VECTOR_VARIANTS)
     @pytest.mark.parametrize("envelope", [False, True])
     @pytest.mark.parametrize("mlp_depth", [1, 2])
     @pytest.mark.parametrize("tripp", [0, 2])
     @pytest.mark.parametrize("depth", [1, 2, 3])
-    def test_matches_the_dense_trace(self, chain, depth, tripp, mlp_depth, envelope):
+    def test_matches_the_dense_trace(self, chain, depth, tripp, mlp_depth, envelope, vector):
         """Exact, not estimated: this must agree to machine precision, with no variance.
 
         :param chain: Path-graph fixture.
         :param depth: Number of message-passing layers.
         :param tripp: Depth of the triple-product MLP.
         :param mlp_depth: Number of hidden blocks in the layer MLPs.
-        :param envelope: Whether the cutoff envelope is on."""
+        :param envelope: Whether the cutoff envelope is on.
+        :param vector: Vector-channel configuration."""
         h_node, x = chain
         net = make_net(
             depth=depth,
             tripp_num_layers=tripp,
             mlp_depth=mlp_depth,
             envelope=envelope,
+            **vector,
         )
 
         x_grad = x.clone().requires_grad_(True)
@@ -525,17 +544,25 @@ class TestLayerSchedule:
 
         return torch.tensor([[0, 1, 5, 6], [1, 0, 6, 5]])
 
+    @pytest.mark.parametrize("vector", VECTOR_VARIANTS)
     @pytest.mark.parametrize("schedule", [(0,), (2,)])
     @pytest.mark.parametrize("tripp", [0, 2])
-    def test_matches_the_dense_trace(self, chain, bonds, tripp, schedule):
+    def test_matches_the_dense_trace(self, chain, bonds, tripp, schedule, vector):
         """The composed pattern must still contain the whole Jacobian, or the trace is wrong.
+
+        The vector channels make this sharper than the unscheduled case: they persist across
+        layers that read *different* edge sets, so a vector aggregated on the radius graph is
+        still carried by a later bonds-only layer. The composition has to cover that path.
 
         :param chain: Path-graph fixture.
         :param bonds: Static edge fixture.
         :param tripp: Depth of the triple-product MLP.
-        :param schedule: Which layers read the dynamic edges."""
+        :param schedule: Which layers read the dynamic edges.
+        :param vector: Vector-channel configuration."""
         h_node, x = chain
-        net = make_net(depth=3, tripp_num_layers=tripp, dynamic_layers=schedule)
+        net = make_net(
+            depth=3, tripp_num_layers=tripp, dynamic_layers=schedule, **vector
+        )
 
         x_grad = x.clone().requires_grad_(True)
         reference = autograd_trace(net(h_node, x_grad, bonds)[1] - x_grad, x_grad)
