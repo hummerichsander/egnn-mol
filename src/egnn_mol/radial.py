@@ -34,7 +34,14 @@ class RadialField(nn.Module):
     the single pairwise sum is the whole receptive field and capacity has to come from the basis
     width and the coefficient head. And ``phi`` is linear in the radial basis by construction --
     the coefficient head predicts the basis weights, never ``phi`` itself -- which is what keeps
-    ``d(phi)/d(d)`` exact rather than another autograd pass."""
+    ``d(phi)/d(d)`` exact rather than another autograd pass.
+
+    Caller-supplied static edges are excluded from the field entirely, like a force field's 1-2/1-3
+    nonbonded exclusion list: they belong to whatever local backbone this field is paired with,
+    which already message-passes over them, and a smooth all-pairs sum has no way to leave a
+    bonded pair alone once it contributes to it -- any bias `phi` picks up near bond length gets
+    applied to every such pair identically. This field only ever scores genuinely-discovered,
+    non-topological pairs."""
 
     def __init__(
         self,
@@ -61,7 +68,10 @@ class RadialField(nn.Module):
         :param m_dim: Hidden width of the coefficient head.
         :param head_depth: Number of hidden blocks in the coefficient head. It never reads
             positions, so it may be as deep as wanted without touching the closed form.
-        :param edge_dim: Static edge-feature dimensionality (0 if no edge features).
+        :param edge_dim: Static edge-feature dimensionality (0 if no edge features). It no longer
+            reaches the output: static edges are excluded from this field, and dynamic ones always
+            carry zero features, so this only sizes the head's input for API parity with the EGNN
+            backbones.
         :param distance_cutoff: If > 0, add a radius graph of dynamic edges, and apply the
             polynomial envelope at that radius so the field stays smooth where edges enter and
             leave it -- without which the divergence would only hold away from the boundary.
@@ -107,17 +117,27 @@ class RadialField(nn.Module):
 
         :param h_node: Node features (N, dim), carrying the time channel if the caller uses one.
         :param x: Node positions (N, 3).
+        Static edges are dropped before anything is computed -- see the class docstring. With no
+        dynamic mechanism configured for a call (no radius graph, no kNN graph) and only static
+        edges supplied, nothing is left to score and the field is exactly zero. That is an
+        intentional contract rather than an error: the same call can be reached through the
+        per-call ``distance_cutoff`` override, so there is no construction-time state to reject.
+
+        :param h_node: Node features (N, dim), carrying the time channel if the caller uses one.
+        :param x: Node positions (N, 3).
         :param edge_index: Static edge connectivity (2, E) as ``[source/neighbor, target/center]``,
-            or None.
+            or None. Excluded from the field; supplying it only marks which discovered pairs to
+            leave to the local backbone.
         :param h_edge: Static edge features (E, edge_dim), or None.
         :param batch: Graph membership (N,), or None for a single graph.
         :param box: Per-node box lengths (N, 3), or None.
         :param distance_cutoff: Radius of the dynamic graph for this call, overriding the
             constructed one; None uses it. The envelope and its derivative taper at the same
             radius, so the closed form keeps matching the field. There is no separate envelope
-            flag here, so ``0.0`` drops the radius graph and its taper together, leaving the
-            static edges. The encoding length scale ``cutoff`` is unaffected -- a radius past it
-            aliases long edges onto short-range basis values.
+            flag here, so ``0.0`` drops the radius graph and its taper together -- and since
+            static edges are excluded regardless, that leaves nothing. The encoding length scale
+            ``cutoff`` is unaffected -- a radius past it aliases long edges onto short-range basis
+            values.
         :return: Velocity (N, 3) and one divergence per graph (num_graphs,)."""
 
         # named `radius`, not `cutoff`: `self.cutoff` two lines below is the encoding scale.
@@ -133,6 +153,10 @@ class RadialField(nn.Module):
             distance_cutoff=radius,
             num_nearest_neighbors=self.num_nearest_neighbors,
         )
+        # the exclusion list: a static edge is the local backbone's to correct, not this field's.
+        dynamic = ~static
+        edge_index = edge_index[:, dynamic]
+        h_edge = h_edge[dynamic] if h_edge is not None else None
         src, dst = edge_index[0], edge_index[1]
 
         rel_x = minimum_image(x[dst] - x[src], box[dst] if box is not None else None)
@@ -145,10 +169,6 @@ class RadialField(nn.Module):
         if radius > 0:
             env = polynomial_envelope(dist, radius, self.envelope_exponent)
             d_env = polynomial_envelope_derivative(dist, radius, self.envelope_exponent)
-            # a static edge never enters or leaves at the cutoff, so it needs no taper; d_env must
-            # go to zero with it or the closed-form derivative stops matching the field.
-            env = torch.where(static[:, None], torch.ones_like(env), env)
-            d_env = torch.where(static[:, None], torch.zeros_like(d_env), d_env)
             b, db = env * b, d_env * b + env * db
 
         # summing the two endpoints keeps phi_ij == phi_ji, so the field stays the gradient

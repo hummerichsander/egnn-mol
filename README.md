@@ -103,8 +103,9 @@ drops straight into `d/dt log p = -div v` with no Hutchinson estimator.
 ## Forward API
 
 The `forward` methods are the primary API. The two EGNNs return `(h_node, x)` and need only
-`h_node` and `x`; `RadialField` returns `(v, div v)` and additionally needs `t`. Static edges
-(bonds) are optional inputs; the distance-based (dynamic) graph is configured at construction
+`h_node` and `x`; `RadialField` returns `(v, div v)`. Static edges (bonds) are optional inputs —
+the two EGNNs message-pass over them like any other edge, while `RadialField` **excludes** them
+from its field entirely (see *RadialField* below); the distance-based (dynamic) graph is configured at construction
 (`distance_cutoff` / `num_nearest_neighbors`). The graph is rebuilt from positions on every
 call, so **`distance_cutoff` may also be passed per call** to resize the neighborhood without
 building a new module — `num_nearest_neighbors` stays construction-only.
@@ -146,18 +147,17 @@ one value per graph. Takes one extra argument:
 `sparsity_pattern` and `jacobian_colouring` take `distance_cutoff` too, so a radius can be
 priced before it is run at.
 
-**`RadialField.forward`** — packed graph tensors plus a time, returning `(v, div v)`:
+**`RadialField.forward`** — packed graph tensors, returning `(v, div v)`:
 
 | Argument | Shape | Description |
 |---|---|---|
-| `h_node` | `(ΣN, dim)` | Node features. |
+| `h_node` | `(ΣN, dim)` | Node features, time channel included if the caller uses one. |
 | `x` | `(ΣN, 3)` | Node positions. |
-| `t` | `(ΣN, 1)` or `(ΣN,)` | Per-node time, fed to the coefficient head. |
-| `edge_index` | `(2, E)`, or `None` | Static bonds, `[source/neighbor, target/center]`. |
-| `h_edge` | `(E, edge_dim)`, or `None` | Static edge features. |
+| `edge_index` | `(2, E)`, or `None` | Static bonds, `[source/neighbor, target/center]`. **Excluded** from the field; passing them only marks which discovered pairs to leave to the local backbone. |
+| `h_edge` | `(E, edge_dim)`, or `None` | Static edge features. Excluded with their edges, so they do not reach the output. |
 | `batch` | `(ΣN,)`, or `None` | Graph membership for a ragged batch. |
 | `box` | `(ΣN, 3)`, or `None` | Per-node periodic box lengths (`None` = open). |
-| `distance_cutoff` | float, or `None` | As above; the envelope **and its derivative** taper at that radius, so the closed form keeps matching the field. There is no separate envelope flag here, so `0.0` drops the radius graph and its taper together. |
+| `distance_cutoff` | float, or `None` | As above; the envelope **and its derivative** taper at that radius, so the closed form keeps matching the field. There is no separate envelope flag here, so `0.0` drops the radius graph and its taper together — and since static edges are excluded regardless, a call with only static edges and no dynamic graph is exactly zero. |
 
 ## Hyperparameters
 
@@ -214,13 +214,23 @@ they do for the two EGNNs. Two arguments are **absent by construction**:
 
 With `distance_cutoff > 0` the polynomial envelope is applied automatically at that radius, so `φ`
 *and* `∂φ/∂d` vanish where edges enter and leave the graph. Without it the field would be
-discontinuous at the cutoff and the divergence would only hold away from the boundary. A static
-edge set needs no envelope: it does not depend on positions, so the field is smooth everywhere.
+discontinuous at the cutoff and the divergence would only hold away from the boundary.
+
+**Static edges are excluded from this field**, like a force field's 1-2/1-3 nonbonded exclusion
+list. They belong to whatever local backbone the field is paired with, which already message-passes
+over them, and a smooth all-pairs sum has no way to leave a bonded pair alone once it contributes
+to one: the same `φ(d)` lands on every pair at that distance, so a bias picked up near bond length
+is applied coherently across the whole molecule and fights the local backbone over the stiffest
+degrees of freedom it owns. Excluding them by *topology* — not by distance — is what keeps the two
+halves of a hybrid field from competing. A call with only static edges and no dynamic graph
+therefore returns exactly zero.
 
 ### Neighborhood — static edges ∪ dynamic edges
 
 The graph is the **union** of externally-supplied static bonds and internally-built distance
 graphs; self-loops are always excluded. With none of the three below active it is **all-pairs**.
+`RadialField` drops the static half of that union immediately, so for it alone "neighborhood"
+means the dynamic graph.
 
 | Name | Default | Description |
 |---|---|---|
@@ -251,6 +261,10 @@ their features — they get an **all-zero** `edge_dim` vector:
 
 To let the network distinguish bonds from distance edges, reserve one channel of `edge_dim` as a
 **bond indicator**: set it to `1` on your static bonds; dynamic edges read `0` there automatically.
+
+None of this reaches `RadialField`'s output: it excludes static edges, and the dynamic ones that
+remain carry all-zero features by construction, so its `edge_dim` only sizes the coefficient head's
+input for API parity with the EGNNs. Set it to `0` there unless you need the widths to match.
 
 ### Distance encoding
 

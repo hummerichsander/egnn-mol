@@ -76,8 +76,11 @@ class TestClosedFormDivergence:
     """The closed form against the autograd trace of the same velocity field."""
 
     @pytest.mark.parametrize("encoding", ENCODINGS)
-    def test_static_all_pairs(self, system, encoding):
-        """A static edge set needs no envelope: the field is smooth everywhere.
+    def test_implicit_all_pairs(self, system, encoding):
+        """No edges and no radius is all-pairs, which needs no envelope: it is smooth everywhere.
+
+        The graph has to come from the distance side rather than a static ``edge_index``, since
+        static edges are excluded from this field entirely.
 
         :param system: System fixture.
         :param encoding: Radial basis under test."""
@@ -85,12 +88,12 @@ class TestClosedFormDivergence:
         x = x.clone().requires_grad_(True)
         net = make_field(encoding=encoding)
 
-        v, div = net(h_node, x, edge_index=full_edge_index(x.shape[0]))
+        v, div = net(h_node, x)
 
         assert torch.allclose(div.squeeze(), autograd_trace(v, x), rtol=1e-9, atol=1e-9)
 
     @pytest.mark.parametrize("encoding", ENCODINGS)
-    def test_static_union_radius(self, system, encoding):
+    def test_radius_graph(self, system, encoding):
         """With a radius graph the envelope is what keeps the closed form exact.
 
         :param system: System fixture.
@@ -99,7 +102,7 @@ class TestClosedFormDivergence:
         x = x.clone().requires_grad_(True)
         net = make_field(encoding=encoding, distance_cutoff=1.0)
 
-        v, div = net(h_node, x, edge_index=full_edge_index(x.shape[0]))
+        v, div = net(h_node, x)
 
         assert torch.allclose(div.squeeze(), autograd_trace(v, x), rtol=1e-9, atol=1e-9)
 
@@ -128,7 +131,7 @@ class TestClosedFormDivergence:
         box = torch.full((x.shape[0], 3), 1.5, dtype=torch.float64)
         net = make_field(encoding=encoding)
 
-        v, div = net(h_node, x, edge_index=full_edge_index(x.shape[0]), box=box)
+        v, div = net(h_node, x, box=box)
 
         assert torch.allclose(div.squeeze(), autograd_trace(v, x), rtol=1e-9, atol=1e-9)
 
@@ -153,12 +156,12 @@ class TestClosedFormDivergence:
         # and the pair contributes nothing at all at the boundary.
         assert torch.allclose(v_out, torch.zeros_like(v_out), atol=1e-10)
 
-    def test_a_long_static_edge_contributes_and_stays_exact(self):
-        """A static edge beyond the cutoff must survive the envelope, closed form included.
+    def test_a_static_edge_contributes_nothing(self):
+        """A static edge is the local backbone's to correct, so this field must not see it at all.
 
-        The envelope tapers where the edge *set* changes, which a static edge never does. Exempting
-        it means ``env -> 1``, so its derivative must go to zero with it or the closed form stops
-        matching the field it claims the divergence of.
+        Supplying one may not change the field by so much as a rounding error -- this is the
+        exclusion list, and it has to hold *while* genuine dynamic edges are present, which is what
+        separates it from the field being trivially zero.
 
         :return: None."""
         cutoff = 1.0
@@ -173,8 +176,33 @@ class TestClosedFormDivergence:
         v, div = net(h_node, x, edge_index=long_edge)
         v_without = net(h_node, pos.clone().requires_grad_(True))[0]
 
-        assert not torch.allclose(v, v_without)
+        assert torch.allclose(v, v_without, atol=1e-12)
+        # and the dynamic pair 0-1 is inside the radius, so this is not the all-zero field.
+        assert not torch.allclose(v, torch.zeros_like(v))
         assert torch.allclose(div.squeeze(), autograd_trace(v, x), rtol=1e-9, atol=1e-9)
+
+    def test_a_static_edge_is_excluded_at_bonded_range_too(self):
+        """The exclusion is by topology, not by distance: a short bond is dropped like any other.
+
+        This is the pathology the exclusion exists for -- a bonded pair sits well inside every
+        radius, so before the exclusion it picked up a full-strength, untapered ``phi(d)`` on top
+        of whatever the local backbone already did with it.
+
+        :return: None."""
+        h_node = torch.randn(3, 8, dtype=torch.float64)
+        pos = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.7, 0.0, 0.0]], dtype=torch.float64
+        )
+        bond = torch.tensor([[0, 1], [1, 0]])
+        net = make_field(distance_cutoff=1.0, cutoff=2.0)
+
+        v_with_bond = net(h_node, pos.clone())[0]
+        v_bond_declared = net(h_node, pos.clone(), edge_index=bond)[0]
+
+        # declaring 0-1 a bond must remove exactly that pair's contribution and nothing else:
+        # node 2 is in neither endpoint, and its own two pairs stay dynamic, so it must not move.
+        assert not torch.allclose(v_with_bond[:2], v_bond_declared[:2])
+        assert torch.allclose(v_bond_declared[2], v_with_bond[2], atol=1e-12)
 
 
 class TestEquivariance:
@@ -188,13 +216,12 @@ class TestEquivariance:
         :param encoding: Radial basis under test."""
         h_node, x = system
         net = make_field(encoding=encoding, distance_cutoff=1.0)
-        edge_index = full_edge_index(x.shape[0])
 
         R = rotation_z(0.7)
         shift = torch.tensor([1.3, -0.4, 2.0], dtype=torch.float64)
 
-        v, div = net(h_node, x, edge_index=edge_index)
-        v_t, div_t = net(h_node, x @ R.T + shift, edge_index=edge_index)
+        v, div = net(h_node, x)
+        v_t, div_t = net(h_node, x @ R.T + shift)
 
         assert torch.allclose(v_t, v @ R.T, atol=1e-10)
         assert torch.allclose(div_t, div, atol=1e-10)
@@ -205,11 +232,10 @@ class TestEquivariance:
         :param system: System fixture."""
         h_node, x = system
         net = make_field(distance_cutoff=1.0)
-        edge_index = full_edge_index(x.shape[0])
 
         M = reflection_z()
-        v, div = net(h_node, x, edge_index=edge_index)
-        v_m, div_m = net(h_node, x @ M.T, edge_index=edge_index)
+        v, div = net(h_node, x)
+        v_m, div_m = net(h_node, x @ M.T)
 
         assert torch.allclose(v_m, v @ M.T, atol=1e-10)
         assert torch.allclose(div_m, div, atol=1e-10)
@@ -244,10 +270,42 @@ class TestBatching:
 
         :param system: System fixture."""
         h_node, x = system
-        v, div = make_field()(h_node, x, edge_index=full_edge_index(x.shape[0]))
+        v, div = make_field()(h_node, x)
 
         assert v.shape == x.shape
         assert div.shape == (1,)
+
+
+class TestStaticEdgesAreExcluded:
+    """The exclusion list: static edges belong to the local backbone, never to this field."""
+
+    def test_no_dynamic_mechanism_is_identically_zero(self, system):
+        """Static edges and no way to discover any others leaves nothing to score.
+
+        Documented rather than rejected: the same state is reachable through the per-call radius
+        override, so there is no construction-time configuration to validate.
+
+        :param system: System fixture."""
+        h_node, x = system
+        net = make_field(distance_cutoff=0.0, num_nearest_neighbors=0)
+
+        v, div = net(h_node, x, edge_index=full_edge_index(x.shape[0]))
+
+        assert torch.allclose(v, torch.zeros_like(v))
+        assert torch.allclose(div, torch.zeros_like(div))
+
+    def test_weights_cannot_move_a_static_only_field(self, system):
+        """No draw of the coefficient head may put velocity on an all-static graph.
+
+        :param system: System fixture."""
+        h_node, x = system
+        edge_index = full_edge_index(x.shape[0])
+
+        for seed in (0, 1, 2):
+            v, div = make_field(seed=seed, distance_cutoff=0.0)(h_node, x, edge_index=edge_index)
+
+            assert torch.allclose(v, torch.zeros_like(v))
+            assert torch.allclose(div, torch.zeros_like(div))
 
 
 class TestInitialisation:
@@ -260,7 +318,7 @@ class TestInitialisation:
         h_node, x = system
         net = RadialField(dim=8, encoding_features=6, cutoff=2.0).double()
 
-        v, div = net(h_node, x, edge_index=full_edge_index(x.shape[0]))
+        v, div = net(h_node, x)
 
         assert torch.allclose(v, torch.zeros_like(v))
         assert torch.allclose(div, torch.zeros_like(div))
@@ -280,11 +338,10 @@ class TestTimeAsANodeFeature:
         :param system: System fixture."""
         h_node, x = system
         net = make_field(dim=h_node.shape[-1] + 1)
-        edge_index = full_edge_index(x.shape[0])
 
         def at(time: float) -> Tensor:
             t = torch.full((h_node.shape[0], 1), time, dtype=torch.float64)
-            return net(torch.cat([h_node, t], dim=-1), x, edge_index=edge_index)[0]
+            return net(torch.cat([h_node, t], dim=-1), x)[0]
 
         assert not torch.allclose(at(0.1), at(0.9), atol=1e-6)
 
@@ -297,9 +354,7 @@ class TestTimeAsANodeFeature:
         t = torch.full((h_node.shape[0], 1), 0.37, dtype=torch.float64)
 
         x = x.clone().requires_grad_(True)
-        v, div = net(
-            torch.cat([h_node, t], dim=-1), x, edge_index=full_edge_index(x.shape[0])
-        )
+        v, div = net(torch.cat([h_node, t], dim=-1), x)
 
         assert torch.allclose(div.squeeze(), autograd_trace(v, x), rtol=1e-9, atol=1e-9)
 
@@ -353,8 +408,11 @@ class TestPerCallCutoff:
         assert torch.allclose(v_in, v_out, atol=1e-10)
         assert torch.allclose(div_in, div_out, atol=1e-10)
 
-    def test_a_zero_radius_drops_the_dynamic_graph(self):
-        """No envelope flag here, so 0.0 legitimately leaves the static edges alone."""
+    def test_per_call_zero_radius_with_only_static_edges_is_exact_zero(self):
+        """A zero radius drops the dynamic graph, and static edges were never in the field.
+
+        This is the case no constructor-time guard could catch: the field was *built* with a
+        radius, and only the call walks it into having nothing to score."""
         net = make_field(distance_cutoff=1.0, cutoff=3.0)
         h_node = torch.randn(3, 8, dtype=torch.float64)
         pos = torch.tensor(
@@ -362,8 +420,10 @@ class TestPerCallCutoff:
         )
         bond = torch.tensor([[0, 1], [1, 0]])
 
-        x = pos.clone().requires_grad_(True)
-        v, div = net(h_node, x, edge_index=bond, distance_cutoff=0.0)
+        v, div = net(h_node, pos.clone(), edge_index=bond, distance_cutoff=0.0)
 
-        assert not torch.allclose(v, net(h_node, pos.clone(), edge_index=bond)[0])
-        assert torch.allclose(div.squeeze(), autograd_trace(v, x), rtol=1e-9, atol=1e-9)
+        assert torch.allclose(v, torch.zeros_like(v))
+        assert torch.allclose(div, torch.zeros_like(div))
+        # the same field does have something to say when its own radius graph is allowed.
+        v_with_radius = net(h_node, pos.clone(), edge_index=bond)[0]
+        assert not torch.allclose(v_with_radius, torch.zeros_like(v_with_radius))
