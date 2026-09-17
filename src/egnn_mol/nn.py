@@ -64,3 +64,28 @@ class DisplacementNorm(nn.Module):
         """:param x: Displacement vectors (..., 3). :return: Rescaled unit vectors (..., 3)."""
         norm = x.norm(dim=-1, keepdim=True)
         return x / norm.clamp(min=self.eps) * self.scale
+
+
+class VectorNorm(nn.Module):
+    """RMS-normalize equivariant vector features, with a learnable gain per channel.
+
+    The scalar counterpart is a ``LayerNorm``, which this deliberately is not: subtracting a mean
+    over the spatial axis, or adding a bias, would add something that does not rotate with the
+    system and the features would stop being vectors. Only multiplication by an invariant scalar
+    survives, so the scale is an RMS over the channels' own norms and the gain is a scalar per
+    channel."""
+
+    def __init__(self, channels: int, eps: float = 1e-8) -> None:
+        """:param channels: Number of vector channels.
+        :param eps: Added inside the square root, so the scale stays differentiable at zero."""
+        super().__init__()
+        self.eps = eps
+        self.gain = nn.Parameter(torch.ones(channels))
+
+    def forward(self, vec: Tensor) -> Tensor:
+        """:param vec: Vector features (..., channels, 3). :return: Normalized features."""
+        # inside the root, not clamped outside it: the channels start at exactly zero, where a
+        # norm has no derivative, and the divergence needs this to stay C^1.
+        scale = vec.pow(2).sum(-1).mean(-1, keepdim=True).add(self.eps).sqrt()
+
+        return vec / scale[..., None] * self.gain[..., None]

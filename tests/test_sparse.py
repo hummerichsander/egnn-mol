@@ -483,3 +483,44 @@ def test_vector_chirality_needs_vector_channels():
     """Contracting channels that do not exist is a configuration error, not a silent no-op."""
     with pytest.raises(ValueError, match="vector_channels"):
         GeometricEGNN(depth=1, dim=8, m_dim=8, vector_chirality=True)
+
+
+def test_vector_norm_bounds_the_channels_without_flattening_the_pseudoscalar(compact_system):
+    """`norm_vec` has to bound the channels without costing the chirality its signal.
+
+    The signed volume is cubic in the vectors, so unnormalized it grows faster than they do and
+    ends up dominating the field -- a reflection residual four orders over the rotation one is a
+    symptom of that, not of healthy chirality. Normalized it is a proportionate term: still
+    unambiguously above the rotation floor, no longer running away. The floor is a ratio rather
+    than an absolute, because normalizing changes the scale of the whole field.
+    """
+    h_node, x, _ = compact_system
+    h_node, x = h_node[0], x[0]
+    edge_index = full_edge_index(torch.arange(x.shape[0]), include_self=False)
+    net = randomized(
+        GeometricEGNN(
+            depth=3,
+            dim=8,
+            m_dim=8,
+            norm_displacement=True,
+            vector_channels=8,
+            vector_chirality=True,
+            norm_vec=True,
+        ),
+        scale=0.3,
+    )
+
+    def run(positions):
+        with torch.no_grad():
+            _, x_out = net(h_node, positions, edge_index=edge_index)
+        return x_out - positions
+
+    centroid = x.mean(0, keepdim=True)
+    v_ref = run(x)
+
+    R, M = rotation_z(math.pi / 5), reflection_z()
+    rotation = rel_err(run((x - centroid) @ R.T + centroid), v_ref @ R.T)
+    reflection = rel_err(run((x - centroid) @ M.T + centroid), v_ref @ M.T)
+
+    assert torch.isfinite(v_ref).all()
+    assert reflection > 10 * rotation

@@ -21,6 +21,7 @@ VECTOR_VARIANTS = [
     {},
     {"vector_channels": 4},
     {"vector_channels": 4, "vector_chirality": True},
+    {"vector_channels": 4, "vector_chirality": True, "norm_vec": True},
 ]
 
 

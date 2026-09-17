@@ -15,7 +15,7 @@ from .encodings import (
     polynomial_envelope_derivative,
 )
 from .geometry import minimum_image, signed_volume, squared_distance
-from .nn import MLP, DisplacementNorm
+from .nn import MLP, DisplacementNorm, VectorNorm
 from .radial import RadialField
 from .sparse import (
     GeometricEGNN,
@@ -38,6 +38,7 @@ __all__ = [
     "GeometricEGNN",
     "RadialField",
     "SparseEGNNLayer",
+    "VectorNorm",
     "bessel",
     "bessel_derivative",
     "build_edges",

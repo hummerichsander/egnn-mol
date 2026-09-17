@@ -3,7 +3,7 @@ from torch import Tensor, nn
 
 from .encodings import Encoding, encode_distance, encoding_width
 from .geometry import signed_volume
-from .nn import MLP, DisplacementNorm
+from .nn import MLP, DisplacementNorm, VectorNorm
 
 
 def _init_mlp(mlp: nn.Module, gain: float = 1e-3) -> None:
@@ -48,6 +48,7 @@ class EquivariantUpdate(nn.Module):
         mlp_depth: int = 1,
         vector_channels: int = 0,
         vector_chirality: bool = False,
+        norm_vec: bool = False,
     ) -> None:
         """Build the update.
 
@@ -82,7 +83,12 @@ class EquivariantUpdate(nn.Module):
             ``vector_channels``. That provenance also means the first layer contributes nothing:
             the channels enter it at zero, so the pseudoscalar is identically zero there and a
             depth-1 stack stays E(3) however this is set. ``tripp_num_layers`` builds its vectors
-            in the layer and acts from the first one, which is the trade for the extra hop."""
+            in the layer and acts from the first one, which is the trade for the extra hop.
+        :param norm_vec: RMS-normalize the vector channels before they pass to the next layer,
+            the equivariant counterpart of ``norm_h_node``. They accumulate additively across
+            layers and are contracted quadratically, so without it their magnitude compounds
+            with depth; the invariants are read before it, which keeps the length information
+            the contraction carries."""
 
         super().__init__()
         self.encoding = encoding
@@ -165,9 +171,13 @@ class EquivariantUpdate(nn.Module):
             self.vec_chirality = (
                 nn.Linear(vector_channels, 3, bias=False) if vector_chirality else None
             )
+            self.vector_norm = (
+                VectorNorm(vector_channels) if norm_vec else nn.Identity()
+            )
         else:
             self.vec_message = self.vec_mix = self.vec_gate = None
             self.vec_chirality = None
+            self.vector_norm = nn.Identity()
 
         _init_mlp(self.edge_mlp)
         _init_mlp(self.node_mlp)
@@ -283,6 +293,14 @@ class EquivariantUpdate(nn.Module):
         v = self.vec_chirality(vec.transpose(-2, -1)).transpose(-2, -1)
 
         return signed_volume(v[:, 0], v[:, 1], v[:, 2])
+
+    def normalize_vec(self, vec: Tensor) -> Tensor:
+        """RMS-normalize the vector channels (identity if ``norm_vec`` is off).
+
+        :param vec: Vector features (num_nodes, vector_channels, 3).
+        :return: The features, normalized or unchanged."""
+
+        return self.vector_norm(vec)
 
     def gate_vec(self, h_node: Tensor, invariants: Tensor) -> Tensor:
         """Node-local gate on the mixed vectors, the one place the scalars steer them.

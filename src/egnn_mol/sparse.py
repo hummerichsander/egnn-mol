@@ -203,6 +203,7 @@ class SparseEGNNLayer(nn.Module):
         mlp_depth: int = 1,
         vector_channels: int = 0,
         vector_chirality: bool = False,
+        norm_vec: bool = False,
     ) -> None:
         """See :class:`GeometricEGNN` for the shared arguments.
 
@@ -227,6 +228,7 @@ class SparseEGNNLayer(nn.Module):
             mlp_depth=mlp_depth,
             vector_channels=vector_channels,
             vector_chirality=vector_chirality,
+            norm_vec=norm_vec,
         )
 
     def forward(
@@ -298,6 +300,9 @@ class SparseEGNNLayer(nn.Module):
 
             u, invariants = self.core.vector_invariants(vec_out)
             vec_out = vec_out + self.core.gate_vec(h_node, invariants)[..., None] * u
+            # after the invariants, not before: normalizing first would hand the contraction
+            # pure directions and throw away how long the accumulated vectors are.
+            vec_out = self.core.normalize_vec(vec_out)
 
         m_pooled = self.pool(m_ij, dst, n, env)
         h_node_out = self.core.update_h_node(h_node, m_pooled, invariants)
