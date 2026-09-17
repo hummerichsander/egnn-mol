@@ -189,20 +189,18 @@ class TestClosedFormDivergence:
         of whatever the local backbone already did with it.
 
         :return: None."""
-        h_node = torch.randn(3, 8, dtype=torch.float64)
-        pos = torch.tensor(
-            [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.7, 0.0, 0.0]], dtype=torch.float64
-        )
+        h_node = torch.randn(2, 8, dtype=torch.float64)
+        pos = torch.tensor([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]], dtype=torch.float64)
         bond = torch.tensor([[0, 1], [1, 0]])
         net = make_field(distance_cutoff=1.0, cutoff=2.0)
 
-        v_with_bond = net(h_node, pos.clone())[0]
-        v_bond_declared = net(h_node, pos.clone(), edge_index=bond)[0]
+        # 0.1 is far inside the radius, so the envelope is ~1 there: exempting this edge from the
+        # taper (what the field used to do) leaves it contributing in full. Excluding it does not.
+        v_dynamic = net(h_node, pos.clone())[0]
+        v_declared_bond = net(h_node, pos.clone(), edge_index=bond)[0]
 
-        # declaring 0-1 a bond must remove exactly that pair's contribution and nothing else:
-        # node 2 is in neither endpoint, and its own two pairs stay dynamic, so it must not move.
-        assert not torch.allclose(v_with_bond[:2], v_bond_declared[:2])
-        assert torch.allclose(v_bond_declared[2], v_with_bond[2], atol=1e-12)
+        assert not torch.allclose(v_dynamic, torch.zeros_like(v_dynamic))
+        assert torch.allclose(v_declared_bond, torch.zeros_like(v_declared_bond))
 
 
 class TestEquivariance:
